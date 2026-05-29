@@ -21,10 +21,12 @@ find_package(Eigen3 REQUIRED)
 
 add_executable(table_drop_tf_node src/table_drop_tf_node.cpp)
 add_executable(container_drop_tf_node src/container_drop_tf_node.cpp)
+add_executable(shelf_drop_tf_node src/shelf_drop_tf_node.cpp)
 
 install(TARGETS
   table_drop_tf_node
   container_drop_tf_node
+  shelf_drop_tf_node
   DESTINATION lib/${PROJECT_NAME})
 
 ament_target_dependencies(table_drop_tf_node
@@ -39,6 +41,17 @@ ament_target_dependencies(table_drop_tf_node
 )
 
 ament_target_dependencies(container_drop_tf_node
+  rclcpp
+  sensor_msgs
+  std_srvs
+  pcl_conversions
+  visualization_msgs
+  geometry_msgs
+  tf2_ros
+  Eigen3
+)
+
+ament_target_dependencies(shelf_drop_tf_node
   rclcpp
   sensor_msgs
   std_srvs
