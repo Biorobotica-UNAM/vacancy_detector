@@ -25,7 +25,7 @@
 #include <std_srvs/srv/set_bool.hpp>
 #include <tf2/exceptions.h>
 #include <tf2_ros/buffer.h>
-#include <tf2_ros/static_transform_broadcaster.h>
+#include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -63,6 +63,10 @@ public:
     declare_parameter<double>("min_wall_coverage", 0.45);
     declare_parameter<double>("max_interior_fill_ratio", 0.35);
     declare_parameter<double>("start_clearance_m", 0.10);
+    declare_parameter<double>("drop_x_offset_m", 0.0);
+    declare_parameter<double>("drop_y_offset_m", 0.0);
+    declare_parameter<bool>("override_drop_y", false);
+    declare_parameter<double>("drop_y_override_m", 0.0);
     declare_parameter<double>("cluster_tolerance_m", 0.045);
     declare_parameter<int>("cluster_min_points", 80);
     declare_parameter<int>("cluster_max_points", 12000);
@@ -84,8 +88,7 @@ public:
 
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
-    static_tf_broadcaster_ =
-        std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
+    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
     cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         pointcloud_topic_, rclcpp::SensorDataQoS(),
@@ -93,7 +96,8 @@ public:
                   std::placeholders::_1));
 
     marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
-        "camera/container_drop_markers", 10);
+        "camera/container_drop_markers",
+        rclcpp::QoS(10).transient_local().reliable());
 
     resetDropPointsFile();
 
@@ -276,8 +280,8 @@ private:
     }
 
     Candidate fixed_best = best;
-    // Publicamos las TF en fixed_frame para que el resto del sistema las pueda
-    // consultar de forma estable, igual que con table_drop_tf_node.
+    // Publicamos las TF en fixed_frame con timestamp real para que el executor
+    // pueda distinguir una deteccion fresca de una deteccion anterior.
     if (!transformCandidateToFixed(fixed_best, error_out)) {
       return false;
     }
@@ -473,21 +477,61 @@ private:
     bool found = false;
     std::string reject_summary;
 
+    int cluster_id = 0;
     for (const auto &cluster : clusters) {
       Candidate candidate;
       std::string reject_reason;
       if (!evaluateCluster(cloud, cluster, floor_z, candidate,
                            reject_reason)) {
+        RCLCPP_INFO(
+            get_logger(),
+            "[container_drop_tf] cluster[%d] rechazado: puntos=%zu reason=%s",
+            cluster_id, cluster.indices.size(), reject_reason.c_str());
         if (reject_summary.empty()) {
           reject_summary = reject_reason;
         }
+        ++cluster_id;
         continue;
       }
+
+      std::string safety_reject;
+      if (!validateDropStartPose(candidate.drop_start, safety_reject)) {
+        RCLCPP_INFO(
+            get_logger(),
+            "[container_drop_tf] cluster[%d] inseguro: puntos=%zu "
+            "center=(%.3f %.3f %.3f) drop=(%.3f %.3f %.3f) "
+            "size=(%.3f %.3f %.3f) coverage=%.2f interior=%.2f score=%.2f "
+            "reason=%s",
+            cluster_id, cluster.indices.size(), candidate.center_floor.x(),
+            candidate.center_floor.y(), candidate.center_floor.z(),
+            candidate.drop_start.x(), candidate.drop_start.y(),
+            candidate.drop_start.z(), candidate.width, candidate.depth,
+            candidate.height, candidate.coverage, candidate.interior_fill,
+            candidate.score, safety_reject.c_str());
+        if (reject_summary.empty()) {
+          reject_summary = safety_reject;
+        }
+        ++cluster_id;
+        continue;
+      }
+
+      RCLCPP_INFO(
+          get_logger(),
+          "[container_drop_tf] cluster[%d] candidato: puntos=%zu "
+          "center=(%.3f %.3f %.3f) drop=(%.3f %.3f %.3f) "
+          "size=(%.3f %.3f %.3f) coverage=%.2f interior=%.2f score=%.2f",
+          cluster_id, cluster.indices.size(), candidate.center_floor.x(),
+          candidate.center_floor.y(), candidate.center_floor.z(),
+          candidate.drop_start.x(), candidate.drop_start.y(),
+          candidate.drop_start.z(), candidate.width, candidate.depth,
+          candidate.height, candidate.coverage, candidate.interior_fill,
+          candidate.score);
 
       if (!found || candidate.score > best.score) {
         best = candidate;
         found = true;
       }
+      ++cluster_id;
     }
 
     if (!found) {
@@ -597,12 +641,24 @@ private:
 
     const float clearance =
         static_cast<float>(get_parameter("start_clearance_m").as_double());
+    const float drop_x_offset =
+        static_cast<float>(get_parameter("drop_x_offset_m").as_double());
+    const float drop_y_offset =
+        static_cast<float>(get_parameter("drop_y_offset_m").as_double());
+    const bool override_drop_y = get_parameter("override_drop_y").as_bool();
+    const float drop_y_override =
+        static_cast<float>(get_parameter("drop_y_override_m").as_double());
+    float drop_y = center_xy.y() + drop_y_offset;
+    if (override_drop_y) {
+      drop_y = drop_y_override;
+    }
     // El punto de drop queda sobre el centro del hueco, un poco arriba del
     // borde mas alto para iniciar la maniobra sin chocar con el contenedor.
     candidate.center_floor = Eigen::Vector3f(center_xy.x(), center_xy.y(),
                                              floor_z);
-    candidate.drop_start = Eigen::Vector3f(center_xy.x(), center_xy.y(),
-                                           max_z + clearance);
+    candidate.drop_start =
+        Eigen::Vector3f(center_xy.x() + drop_x_offset, drop_y,
+                        max_z + clearance);
     candidate.axis_x = Eigen::Vector3f(axis_x.x(), axis_x.y(), 0.0f);
     candidate.axis_y = Eigen::Vector3f(axis_y.x(), axis_y.y(), 0.0f);
     candidate.axis_z = Eigen::Vector3f(0.0f, 0.0f, 1.0f);
@@ -612,8 +668,9 @@ private:
     candidate.coverage = shape.coverage;
     candidate.interior_fill = shape.interior_fill;
     candidate.score = 2.0f * shape.coverage - shape.interior_fill +
-                      0.5f * height - 0.15f * std::hypot(center_xy.x(),
-                                                         center_xy.y());
+                      0.4f * width + 0.3f * depth - 0.35f * height -
+                      0.35f * std::fabs(center_xy.y()) -
+                      0.15f * std::hypot(center_xy.x(), center_xy.y());
     return true;
   }
 
@@ -804,8 +861,8 @@ private:
     drop_tf.transform.translation.z = rel.dot(candidate.axis_z);
     drop_tf.transform.rotation.w = 1.0;
 
-    static_tf_broadcaster_->sendTransform(container_tf);
-    static_tf_broadcaster_->sendTransform(drop_tf);
+    tf_broadcaster_->sendTransform(container_tf);
+    tf_broadcaster_->sendTransform(drop_tf);
   }
 
   void resetDropPointsFile() {
@@ -859,18 +916,23 @@ private:
       marker.pose.position.y = saved.point.y();
       marker.pose.position.z = saved.point.z();
       marker.pose.orientation.w = 1.0;
-      marker.scale.x = 0.065;
-      marker.scale.y = 0.065;
-      marker.scale.z = 0.065;
-      marker.color.r = 0.0f;
-      marker.color.g = 1.0f;
-      marker.color.b = 0.35f;
+      marker.scale.x = 0.07;
+      marker.scale.y = 0.07;
+      marker.scale.z = 0.07;
+      marker.color.r = 1.0f;
+      marker.color.g = 0.2f;
+      marker.color.b = 0.0f;
       marker.color.a = 0.9f;
       marker.lifetime = rclcpp::Duration(0, 0);
       markers.markers.push_back(marker);
     }
 
     marker_pub_->publish(markers);
+    RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "[container_drop_tf] esferas seguras publicadas: count=%zu frame=%s "
+        "topic=/vision/camera/container_drop_markers",
+        saved_drop_points_.size(), fixed_frame_id_.c_str());
   }
 
   std::string pointcloud_topic_;
@@ -886,7 +948,7 @@ private:
   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr enable_srv_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
-  std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   std::vector<SavedDropPoint> saved_drop_points_;
   int next_drop_point_id_{0};
   bool drop_point_saved_this_activation_{false};
