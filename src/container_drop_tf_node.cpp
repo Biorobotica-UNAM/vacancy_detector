@@ -25,7 +25,7 @@
 #include <std_srvs/srv/set_bool.hpp>
 #include <tf2/exceptions.h>
 #include <tf2_ros/buffer.h>
-#include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -62,10 +62,19 @@ public:
     declare_parameter<double>("rim_band_m", 0.055);
     declare_parameter<double>("min_wall_coverage", 0.45);
     declare_parameter<double>("max_interior_fill_ratio", 0.35);
+    // Altura extra sobre la superficie/borde detectado donde se dibuja y
+    // publica container_drop_start. Subirlo ayuda a evitar colisiones.
     declare_parameter<double>("start_clearance_m", 0.10);
+    // Desplazamiento frontal del punto de esfera/drop. En base_link, +X mueve
+    // la marca hacia el interior/lejos del robot; -X la acerca al robot.
     declare_parameter<double>("drop_x_offset_m", 0.0);
+    // Desplazamiento lateral relativo del punto de esfera/drop. En base_link,
+    // +Y mueve la marca a la izquierda del robot; -Y a la derecha.
     declare_parameter<double>("drop_y_offset_m", 0.0);
+    // Si es true, ignora el Y detectado y fuerza la esfera/drop a un Y fijo.
+    // Es util cuando la cubeta esta centrada pero la nube detecta solo un borde.
     declare_parameter<bool>("override_drop_y", false);
+    // Valor lateral absoluto usado cuando override_drop_y=true.
     declare_parameter<double>("drop_y_override_m", 0.0);
     declare_parameter<double>("cluster_tolerance_m", 0.045);
     declare_parameter<int>("cluster_min_points", 80);
@@ -88,7 +97,8 @@ public:
 
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
-    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+    static_tf_broadcaster_ =
+        std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
 
     cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         pointcloud_topic_, rclcpp::SensorDataQoS(),
@@ -96,7 +106,7 @@ public:
                   std::placeholders::_1));
 
     marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
-        "camera/container_drop_markers",
+        "camera/drop_markers",
         rclcpp::QoS(10).transient_local().reliable());
 
     resetDropPointsFile();
@@ -280,8 +290,8 @@ private:
     }
 
     Candidate fixed_best = best;
-    // Publicamos las TF en fixed_frame con timestamp real para que el executor
-    // pueda distinguir una deteccion fresca de una deteccion anterior.
+    // Publicamos las TF en fixed_frame como estaticas para que permanezcan
+    // visibles/disponibles hasta que una nueva busqueda las reemplace.
     if (!transformCandidateToFixed(fixed_best, error_out)) {
       return false;
     }
@@ -648,6 +658,8 @@ private:
     const bool override_drop_y = get_parameter("override_drop_y").as_bool();
     const float drop_y_override =
         static_cast<float>(get_parameter("drop_y_override_m").as_double());
+    // La esfera se calcula desde el centro detectado del cluster, luego se
+    // corrige con offsets calibrables para colocarla dentro de la cubeta real.
     float drop_y = center_xy.y() + drop_y_offset;
     if (override_drop_y) {
       drop_y = drop_y_override;
@@ -861,8 +873,8 @@ private:
     drop_tf.transform.translation.z = rel.dot(candidate.axis_z);
     drop_tf.transform.rotation.w = 1.0;
 
-    tf_broadcaster_->sendTransform(container_tf);
-    tf_broadcaster_->sendTransform(drop_tf);
+    static_tf_broadcaster_->sendTransform(container_tf);
+    static_tf_broadcaster_->sendTransform(drop_tf);
   }
 
   void resetDropPointsFile() {
@@ -877,6 +889,7 @@ private:
   }
 
   void saveDropPoint(const Eigen::Vector3f &start_point) {
+    saved_drop_points_.clear();
     SavedDropPoint saved;
     saved.id = next_drop_point_id_++;
     saved.point = start_point;
@@ -931,7 +944,7 @@ private:
     RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), 1000,
         "[container_drop_tf] esferas seguras publicadas: count=%zu frame=%s "
-        "topic=/vision/camera/container_drop_markers",
+        "topic=/vision/camera/drop_markers",
         saved_drop_points_.size(), fixed_frame_id_.c_str());
   }
 
@@ -948,7 +961,7 @@ private:
   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr enable_srv_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
-  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
   std::vector<SavedDropPoint> saved_drop_points_;
   int next_drop_point_id_{0};
   bool drop_point_saved_this_activation_{false};

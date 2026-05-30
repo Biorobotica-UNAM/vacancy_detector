@@ -97,7 +97,8 @@ public:
         std::bind(&ShelfDropTfNode::cloudCallback, this, std::placeholders::_1));
 
     marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
-        "camera/shelf_drop_markers", 10);
+        "camera/drop_markers",
+        rclcpp::QoS(10).transient_local().reliable());
 
     resetDropPointsFile();
 
@@ -802,6 +803,11 @@ private:
     }
 
     marker_pub_->publish(markers);
+    RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "[shelf_drop_tf] esferas seguras publicadas: count=%zu frame=%s "
+        "topic=/vision/camera/drop_markers",
+        saved_drop_points_.size(), fixed_frame_id_.c_str());
   }
 
   std::string pointcloud_topic_;
