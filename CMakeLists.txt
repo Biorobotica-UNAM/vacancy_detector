@@ -16,6 +16,7 @@ find_package(std_srvs REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(vision_interfaces REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(Eigen3 REQUIRED)
 
@@ -27,6 +28,10 @@ install(TARGETS
   table_drop_tf_node
   container_drop_tf_node
   shelf_drop_tf_node
+  DESTINATION lib/${PROJECT_NAME})
+
+install(PROGRAMS
+  scripts/container_yolo_world_node.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_target_dependencies(table_drop_tf_node
@@ -47,6 +52,7 @@ ament_target_dependencies(container_drop_tf_node
   pcl_conversions
   visualization_msgs
   geometry_msgs
+  vision_interfaces
   tf2_ros
   Eigen3
 )
