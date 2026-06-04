@@ -41,6 +41,8 @@ public:
     declare_parameter<std::string>("drop_points_file",
                                    "src/Vision/vacancy_detector/src/"
                                    "shelf_drop_points.txt");
+    declare_parameter<std::string>("cloud_filter_enable_service",
+                                   "/vision/shelf_cloud_filter/enable");
 
     declare_parameter<double>("roi_x_min_m", 0.20);
     declare_parameter<double>("roi_x_max_m", 1.60);
@@ -85,6 +87,8 @@ public:
     shelf_frame_id_ = get_parameter("shelf_frame_id").as_string();
     drop_start_frame_id_ = get_parameter("drop_start_frame_id").as_string();
     drop_points_file_ = get_parameter("drop_points_file").as_string();
+    cloud_filter_enable_service_ =
+        get_parameter("cloud_filter_enable_service").as_string();
     active_ = get_parameter("active_on_start").as_bool();
 
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
@@ -106,6 +110,8 @@ public:
         "shelf_drop_tf/enable",
         std::bind(&ShelfDropTfNode::enableCallback, this,
                   std::placeholders::_1, std::placeholders::_2));
+    cloud_filter_enable_client_ =
+        create_client<std_srvs::srv::SetBool>(cloud_filter_enable_service_);
 
     RCLCPP_INFO(get_logger(),
                 "[shelf_drop_tf] Nodo iniciado. pointcloud_topic=%s "
@@ -177,7 +183,10 @@ private:
     active_ = request->data;
     if (active_) {
       drop_point_saved_this_activation_ = false;
+      setCloudFilterEnabled(true);
       publishMarkers();
+    } else {
+      setCloudFilterEnabled(false);
     }
 
     response->success = true;
@@ -266,6 +275,7 @@ private:
     saveDropPoint(fixed_start_point);
     publishMarkers();
     drop_point_saved_this_activation_ = true;
+    setCloudFilterEnabled(false);
 
     RCLCPP_INFO(
         get_logger(),
@@ -278,6 +288,19 @@ private:
 
     error_out.clear();
     return true;
+  }
+
+  void setCloudFilterEnabled(bool enabled) {
+    if (!cloud_filter_enable_client_->service_is_ready()) {
+      RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 3000,
+          "[shelf_drop_tf] filtro vacancy no disponible: %s",
+          cloud_filter_enable_service_.c_str());
+      return;
+    }
+    auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
+    request->data = enabled;
+    cloud_filter_enable_client_->async_send_request(request);
   }
 
   bool transformCloudToValidation(
@@ -816,11 +839,13 @@ private:
   std::string shelf_frame_id_;
   std::string drop_start_frame_id_;
   std::string drop_points_file_;
+  std::string cloud_filter_enable_service_;
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       marker_pub_;
   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr enable_srv_;
+  rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr cloud_filter_enable_client_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
   std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
