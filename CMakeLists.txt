@@ -12,6 +12,7 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(visualization_msgs REQUIRED)
@@ -23,11 +24,13 @@ find_package(Eigen3 REQUIRED)
 add_executable(table_drop_tf_node src/table_drop_tf_node.cpp)
 add_executable(container_drop_tf_node src/container_drop_tf_node.cpp)
 add_executable(shelf_drop_tf_node src/shelf_drop_tf_node.cpp)
+add_executable(vacancy_cloud_filter_node src/vacancy_cloud_filter_node.cpp)
 
 install(TARGETS
   table_drop_tf_node
   container_drop_tf_node
   shelf_drop_tf_node
+  vacancy_cloud_filter_node
   DESTINATION lib/${PROJECT_NAME})
 
 install(PROGRAMS
@@ -64,6 +67,15 @@ ament_target_dependencies(shelf_drop_tf_node
   pcl_conversions
   visualization_msgs
   geometry_msgs
+  tf2_ros
+  Eigen3
+)
+
+ament_target_dependencies(vacancy_cloud_filter_node
+  rclcpp
+  sensor_msgs
+  std_msgs
+  std_srvs
   tf2_ros
   Eigen3
 )
