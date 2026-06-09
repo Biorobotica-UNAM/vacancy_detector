@@ -74,7 +74,7 @@ public:
       output_topic_, rclcpp::QoS(5).reliable());
 
     enable_srv_ = create_service<std_srvs::srv::SetBool>(
-      "enable",
+      "vacancy_cloud_filter/enable",
       std::bind(
         &VacancyCloudFilterNode::enable_callback,
         this,

@@ -611,7 +611,7 @@ private:
   }
 
   void setCloudFilterEnabled(bool enabled) {
-    if (!cloud_filter_enable_client_->service_is_ready()) {
+    if (!cloud_filter_enable_client_->wait_for_service(1s)) {
       RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 3000,
           "[container_drop_tf] filtro vacancy no disponible: %s",
@@ -620,7 +620,16 @@ private:
     }
     auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
     request->data = enabled;
-    cloud_filter_enable_client_->async_send_request(request);
+    cloud_filter_enable_client_->async_send_request(
+        request,
+        [this, enabled](rclcpp::Client<std_srvs::srv::SetBool>::SharedFuture future) {
+          const auto response = future.get();
+          RCLCPP_INFO(get_logger(),
+                      "[container_drop_tf] filtro vacancy %s: success=%s msg='%s'",
+                      enabled ? "enable" : "disable",
+                      response->success ? "true" : "false",
+                      response->message.c_str());
+        });
   }
 
   bool transformCloudToValidation(
