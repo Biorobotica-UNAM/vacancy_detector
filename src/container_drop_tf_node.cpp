@@ -26,7 +26,7 @@
 #include <std_srvs/srv/set_bool.hpp>
 #include <tf2/exceptions.h>
 #include <tf2_ros/buffer.h>
-#include <tf2_ros/static_transform_broadcaster.h>
+#include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 #include <vision_interfaces/srv/get_detections.hpp>
 #include <visualization_msgs/msg/marker.hpp>
@@ -119,8 +119,7 @@ public:
 
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
-    static_tf_broadcaster_ =
-        std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
+    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
     yolo_client_ = create_client<vision_interfaces::srv::GetDetections>(
         get_parameter("yolo_service").as_string());
 
@@ -132,6 +131,8 @@ public:
     marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
         "camera/drop_markers",
         rclcpp::QoS(10).transient_local().reliable());
+    roi_debug_cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+        "container_drop_tf/owl_roi_points", rclcpp::SensorDataQoS());
 
     resetDropPointsFile();
 
@@ -260,10 +261,14 @@ private:
     active_ = request->data;
     if (active_) {
       drop_point_saved_this_activation_ = false;
+      // Cada escaneo debe iniciar sin esferas previas; si no, RViz muestra
+      // puntos viejos mientras OWLv2 y la nube nueva todavia estan procesando.
+      saved_drop_points_.clear();
+      publishMarkers();
+      publishDebugCloud(pcl::PointCloud<pcl::PointXYZ>(), validation_frame_id_);
       setCloudFilterEnabled(true);
       resetYoloState();
       requestYoloDetections();
-      publishMarkers();
     } else {
       setCloudFilterEnabled(false);
     }
@@ -508,6 +513,7 @@ private:
     // La ROI reduce falsos positivos: buscamos contenedores bajos y cercanos,
     // no paredes, personas ni muebles fuera del alcance de drop.
     applyRoi(validation_cloud, roi_cloud);
+    publishDebugCloud(*roi_cloud, validation_frame_id_);
 
     RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), 1500,
@@ -804,6 +810,12 @@ private:
         static_cast<std::uint32_t>(validation_cloud->points.size());
     validation_cloud->height = 1;
     validation_cloud->is_dense = false;
+
+    if (can_use_image_roi || can_use_gate_roi) {
+      logCloudWindow(validation_cloud,
+                     can_use_image_roi ? "owl_roi_3d" : "owl_gate_full_cloud");
+    }
+
     if (can_use_gate_roi) {
       gate_bounds.valid = gate_bounds.points >= 30;
       if (gate_bounds.valid) {
@@ -1387,8 +1399,40 @@ private:
     drop_tf.transform.translation.z = rel.dot(candidate.axis_z);
     drop_tf.transform.rotation.w = 1.0;
 
-    static_tf_broadcaster_->sendTransform(container_tf);
-    static_tf_broadcaster_->sendTransform(drop_tf);
+    tf_broadcaster_->sendTransform(container_tf);
+    tf_broadcaster_->sendTransform(drop_tf);
+  }
+
+  void logCloudWindow(const pcl::PointCloud<pcl::PointXYZ>::Ptr &cloud,
+                      const std::string &label) const {
+    if (!cloud || cloud->empty()) {
+      RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 1500,
+          "[container_drop_tf] ventana %s sin puntos validos", label.c_str());
+      return;
+    }
+
+    float min_x = std::numeric_limits<float>::max();
+    float min_y = std::numeric_limits<float>::max();
+    float min_z = std::numeric_limits<float>::max();
+    float max_x = -std::numeric_limits<float>::max();
+    float max_y = -std::numeric_limits<float>::max();
+    float max_z = -std::numeric_limits<float>::max();
+    for (const auto &pt : cloud->points) {
+      min_x = std::min(min_x, pt.x);
+      min_y = std::min(min_y, pt.y);
+      min_z = std::min(min_z, pt.z);
+      max_x = std::max(max_x, pt.x);
+      max_y = std::max(max_y, pt.y);
+      max_z = std::max(max_z, pt.z);
+    }
+
+    RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 1500,
+        "[container_drop_tf] ventana %s puntos=%zu x=[%.3f %.3f] "
+        "y=[%.3f %.3f] z=[%.3f %.3f]",
+        label.c_str(), cloud->size(), min_x, max_x, min_y, max_y, min_z,
+        max_z);
   }
 
   void resetDropPointsFile() {
@@ -1462,6 +1506,18 @@ private:
         saved_drop_points_.size(), fixed_frame_id_.c_str());
   }
 
+  void publishDebugCloud(const pcl::PointCloud<pcl::PointXYZ> &cloud,
+                         const std::string &frame_id) const {
+    if (!roi_debug_cloud_pub_) {
+      return;
+    }
+    sensor_msgs::msg::PointCloud2 msg;
+    pcl::toROSMsg(cloud, msg);
+    msg.header.frame_id = frame_id;
+    msg.header.stamp = now();
+    roi_debug_cloud_pub_->publish(msg);
+  }
+
   std::string pointcloud_topic_;
   std::string fixed_frame_id_;
   std::string validation_frame_id_;
@@ -1473,13 +1529,15 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       marker_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr
+      roi_debug_cloud_pub_;
   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr enable_srv_;
   rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr cloud_filter_enable_client_;
   rclcpp::Client<vision_interfaces::srv::GetDetections>::SharedPtr
       yolo_client_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
-  std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   std::vector<SavedDropPoint> saved_drop_points_;
   rclcpp::Client<vision_interfaces::srv::GetDetections>::SharedFuture
       yolo_future_;

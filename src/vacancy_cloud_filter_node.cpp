@@ -485,7 +485,15 @@ private:
     uint64_t sequence = 0;
     {
       std::lock_guard<std::mutex> lock(latest_cloud_mutex_);
-      if (!latest_cloud_ || latest_cloud_sequence_ == processed_cloud_sequence_) {
+      if (!latest_cloud_) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "[vacancy_cloud_filter] enabled pero aun no recibe nubes input=%s "
+          "qos=%s output=%s",
+          input_topic_.c_str(), input_qos_mode_.c_str(), output_topic_.c_str());
+        return;
+      }
+      if (latest_cloud_sequence_ == processed_cloud_sequence_) {
         return;
       }
       msg = latest_cloud_;
@@ -577,6 +585,14 @@ private:
       static_cast<std::size_t>(input.width) * static_cast<std::size_t>(input.height);
     const float nan = std::numeric_limits<float>::quiet_NaN();
     auto * base_ptr = output.data.data();
+    std::size_t finite_points = 0;
+    std::size_t accepted_points = 0;
+    double min_x = std::numeric_limits<double>::max();
+    double min_y = std::numeric_limits<double>::max();
+    double min_z = std::numeric_limits<double>::max();
+    double max_x = -std::numeric_limits<double>::max();
+    double max_y = -std::numeric_limits<double>::max();
+    double max_z = -std::numeric_limits<double>::max();
 
     for (std::size_t i = 0; i < total_points; ++i) {
       auto * point_ptr = base_ptr + i * output.point_step;
@@ -589,8 +605,18 @@ private:
 
       bool accepted = std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
       if (accepted) {
+        ++finite_points;
         const Eigen::Vector3f point_base = rotation * Eigen::Vector3f(x, y, z) + translation;
         accepted = point_in_roi(point_base);
+        if (accepted) {
+          ++accepted_points;
+          min_x = std::min(min_x, static_cast<double>(point_base.x()));
+          min_y = std::min(min_y, static_cast<double>(point_base.y()));
+          min_z = std::min(min_z, static_cast<double>(point_base.z()));
+          max_x = std::max(max_x, static_cast<double>(point_base.x()));
+          max_y = std::max(max_y, static_cast<double>(point_base.y()));
+          max_z = std::max(max_z, static_cast<double>(point_base.z()));
+        }
       }
 
       if (!accepted) {
@@ -602,6 +628,23 @@ private:
 
     output.is_dense = false;
     pub_cloud_->publish(output);
+    if (accepted_points == 0) {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 1500,
+        "[vacancy_cloud_filter] organized profile=%s input=%zu finite=%zu "
+        "accepted=0 roi_x=[%.2f %.2f] roi_y=[%.2f %.2f] roi_z=[%.2f %.2f]",
+        profile_.c_str(), total_points, finite_points,
+        roi_x_min_, roi_x_max_, roi_y_min_, roi_y_max_, roi_z_min_, roi_z_max_);
+    } else {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 1500,
+        "[vacancy_cloud_filter] organized profile=%s input=%zu finite=%zu "
+        "accepted=%zu base_window x=[%.3f %.3f] y=[%.3f %.3f] z=[%.3f %.3f] "
+        "roi_x=[%.2f %.2f] roi_y=[%.2f %.2f] roi_z=[%.2f %.2f]",
+        profile_.c_str(), total_points, finite_points, accepted_points,
+        min_x, max_x, min_y, max_y, min_z, max_z,
+        roi_x_min_, roi_x_max_, roi_y_min_, roi_y_max_, roi_z_min_, roi_z_max_);
+    }
   }
 
   int count_neighbors(
@@ -746,6 +789,14 @@ private:
     }
 
     publish_compact_cloud(*msg, accepted);
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 1500,
+      "[vacancy_cloud_filter] compact profile=%s input=%zu voxels=%zu "
+      "accepted=%zu roi_x=[%.2f %.2f] roi_y=[%.2f %.2f] roi_z=[%.2f %.2f] "
+      "leaf=%.3f downsample=%d",
+      profile_.c_str(), total_points, voxels.size(), accepted.size(),
+      roi_x_min_, roi_x_max_, roi_y_min_, roi_y_max_, roi_z_min_, roi_z_max_,
+      voxel_leaf_size_, input_downsampling_);
   }
 };
 
