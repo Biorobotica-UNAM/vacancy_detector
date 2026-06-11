@@ -24,7 +24,7 @@
 #include <std_srvs/srv/set_bool.hpp>
 #include <tf2/exceptions.h>
 #include <tf2_ros/buffer.h>
-#include <tf2_ros/static_transform_broadcaster.h>
+#include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -80,8 +80,7 @@ public:
 
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
-    static_tf_broadcaster_ =
-        std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
+    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
     cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         pointcloud_topic_, rclcpp::SensorDataQoS(),
@@ -881,8 +880,8 @@ private:
     drop_tf.transform.translation.z = get_parameter("start_height_m").as_double();
     drop_tf.transform.rotation.w = 1.0;
 
-    static_tf_broadcaster_->sendTransform(table_tf);
-    static_tf_broadcaster_->sendTransform(drop_tf);
+    tf_broadcaster_->sendTransform(table_tf);
+    tf_broadcaster_->sendTransform(drop_tf);
 
     RCLCPP_DEBUG(get_logger(),
                  "[table_drop_tf] TF emitidas parent=%s table=%s drop=%s "
@@ -998,7 +997,7 @@ private:
   rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr cloud_filter_enable_client_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
-  std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   std::vector<SavedDropPoint> saved_drop_points_;
   int next_drop_point_id_{0};
   bool drop_point_saved_this_activation_{false};
