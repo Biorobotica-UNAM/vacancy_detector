@@ -24,7 +24,7 @@
 #include <std_srvs/srv/set_bool.hpp>
 #include <tf2/exceptions.h>
 #include <tf2_ros/buffer.h>
-#include <tf2_ros/static_transform_broadcaster.h>
+#include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -42,22 +42,26 @@ public:
     declare_parameter<std::string>("drop_points_file",
                                    "src/Vision/vacancy_detector/src/"
                                    "table_drop_points.txt");
+    declare_parameter<std::string>("cloud_filter_enable_service",
+                                   "/vision/table_cloud_filter/enable");
     declare_parameter<double>("start_height_m", 0.10);
-    declare_parameter<double>("front_margin_m", 0.15);
+    declare_parameter<double>("front_margin_m", 0.05);
     declare_parameter<double>("side_margin_m", 0.10);
     declare_parameter<double>("back_margin_m", 0.10);
-    declare_parameter<double>("obstacle_margin_m", 0.15);
+    declare_parameter<double>("obstacle_margin_m", 0.10);
     declare_parameter<double>("obstacle_min_height_m", 0.03);
     declare_parameter<double>("obstacle_max_height_m", 0.35);
     declare_parameter<double>("preferred_x_m", 0.0);
-    declare_parameter<int>("min_front_edge_points", 30);
-    declare_parameter<int>("min_front_edge_line_inliers", 20);
+    declare_parameter<double>("preferred_y_m", 0.08);
+    declare_parameter<double>("preferred_point_weight", 1.20);
+    declare_parameter<int>("min_front_edge_points", 12);
+    declare_parameter<int>("min_front_edge_line_inliers", 8);
     declare_parameter<double>("safe_x_min_m", 0.15);
-    declare_parameter<double>("safe_x_max_m", 1.20);
-    declare_parameter<double>("safe_abs_y_max_m", 0.80);
+    declare_parameter<double>("safe_x_max_m", 0.80);
+    declare_parameter<double>("safe_abs_y_max_m", 0.55);
     declare_parameter<double>("safe_z_min_m", 0.35);
     declare_parameter<double>("safe_z_max_m", 1.40);
-    declare_parameter<double>("safe_dist_xy_max_m", 1.40);
+    declare_parameter<double>("safe_dist_xy_max_m", 1.05);
     declare_parameter<double>("roi_x_min_m", -1.5);
     declare_parameter<double>("roi_x_max_m", 1.5);
     declare_parameter<double>("roi_y_min_m", -0.8);
@@ -72,12 +76,13 @@ public:
     table_frame_id_ = get_parameter("table_frame_id").as_string();
     drop_start_frame_id_ = get_parameter("drop_start_frame_id").as_string();
     drop_points_file_ = get_parameter("drop_points_file").as_string();
+    cloud_filter_enable_service_ =
+        get_parameter("cloud_filter_enable_service").as_string();
     active_ = get_parameter("active_on_start").as_bool();
 
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
-    static_tf_broadcaster_ =
-        std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
+    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
     cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         pointcloud_topic_, rclcpp::SensorDataQoS(),
@@ -93,6 +98,8 @@ public:
         "table_drop_tf/enable",
         std::bind(&TableDropTfNode::enableCallback, this,
                   std::placeholders::_1, std::placeholders::_2));
+    cloud_filter_enable_client_ =
+        create_client<std_srvs::srv::SetBool>(cloud_filter_enable_service_);
 
     RCLCPP_INFO(get_logger(),
                 "[table_drop_tf] Nodo iniciado. pointcloud_topic=%s "
@@ -142,7 +149,10 @@ private:
     active_ = request->data;
     if (active_) {
       drop_point_saved_this_activation_ = false;
+      setCloudFilterEnabled(true);
       publishMarkers();
+    } else {
+      setCloudFilterEnabled(false);
     }
 
     response->success = true;
@@ -410,6 +420,7 @@ private:
     saveDropPoint(fixed_start_point);
     publishMarkers();
     drop_point_saved_this_activation_ = true;
+    setCloudFilterEnabled(false);
 
     RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), 1000,
@@ -421,6 +432,28 @@ private:
 
     error_out.clear();
     return true;
+  }
+
+  void setCloudFilterEnabled(bool enabled) {
+    if (!cloud_filter_enable_client_->wait_for_service(1s)) {
+      RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 3000,
+          "[table_drop_tf] filtro vacancy no disponible: %s",
+          cloud_filter_enable_service_.c_str());
+      return;
+    }
+    auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
+    request->data = enabled;
+    cloud_filter_enable_client_->async_send_request(
+        request,
+        [this, enabled](rclcpp::Client<std_srvs::srv::SetBool>::SharedFuture future) {
+          const auto response = future.get();
+          RCLCPP_INFO(get_logger(),
+                      "[table_drop_tf] filtro vacancy %s: success=%s msg='%s'",
+                      enabled ? "enable" : "disable",
+                      response->success ? "true" : "false",
+                      response->message.c_str());
+        });
   }
 
   bool extractFrontEdge(const pcl::PointCloud<pcl::PointXYZ>::Ptr &table_cloud,
@@ -602,6 +635,10 @@ private:
         static_cast<float>(get_parameter("obstacle_margin_m").as_double());
     const float preferred_x =
         static_cast<float>(get_parameter("preferred_x_m").as_double());
+    const float preferred_y_param =
+        static_cast<float>(get_parameter("preferred_y_m").as_double());
+    const float preferred_point_weight = static_cast<float>(
+        get_parameter("preferred_point_weight").as_double());
 
     const float ux_min = x_min + side_margin;
     const float ux_max = x_max - side_margin;
@@ -621,7 +658,8 @@ private:
       return false;
     }
 
-    const float preferred_y = (uy_min + uy_max) * 0.5f;
+    const float preferred_y =
+        std::clamp(preferred_y_param, uy_min, uy_max);
     const int grid_x = 15;
     const int grid_y = 15;
 
@@ -647,14 +685,16 @@ private:
 
         const float border_clearance =
             std::min({x - ux_min, ux_max - x, y - uy_min, uy_max - y});
-        const float center_cost = std::hypot(x - preferred_x, y - preferred_y);
+        const float preferred_point_cost =
+            std::hypot(x - preferred_x, y - preferred_y);
         const float obstacle_score =
             std::min(min_obstacle_distance, obstacle_margin * 2.0f);
 
         Candidate candidate;
         candidate.x = x;
         candidate.y = y;
-        candidate.score = border_clearance + obstacle_score - 0.25f * center_cost;
+        candidate.score = border_clearance + obstacle_score -
+                          preferred_point_weight * preferred_point_cost;
 
         if (!found || candidate.score > best.score) {
           best = candidate;
@@ -670,10 +710,12 @@ private:
       return false;
     }
 
-    RCLCPP_DEBUG(get_logger(),
-                 "[table_drop_tf] mejor candidato: local=(%.3f, %.3f) "
-                 "score=%.3f obstaculos=%zu",
-                 best.x, best.y, best.score, obstacles.size());
+    RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "[table_drop_tf] mejor candidato: local=(%.3f, %.3f) score=%.3f "
+        "preferido=(%.3f, %.3f) obstaculos=%zu",
+        best.x, best.y, best.score, preferred_x, preferred_y,
+        obstacles.size());
 
     return true;
   }
@@ -849,8 +891,8 @@ private:
     drop_tf.transform.translation.z = get_parameter("start_height_m").as_double();
     drop_tf.transform.rotation.w = 1.0;
 
-    static_tf_broadcaster_->sendTransform(table_tf);
-    static_tf_broadcaster_->sendTransform(drop_tf);
+    tf_broadcaster_->sendTransform(table_tf);
+    tf_broadcaster_->sendTransform(drop_tf);
 
     RCLCPP_DEBUG(get_logger(),
                  "[table_drop_tf] TF emitidas parent=%s table=%s drop=%s "
@@ -957,14 +999,16 @@ private:
   std::string table_frame_id_;
   std::string drop_start_frame_id_;
   std::string drop_points_file_;
+  std::string cloud_filter_enable_service_;
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       marker_pub_;
   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr enable_srv_;
+  rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr cloud_filter_enable_client_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
-  std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   std::vector<SavedDropPoint> saved_drop_points_;
   int next_drop_point_id_{0};
   bool drop_point_saved_this_activation_{false};
