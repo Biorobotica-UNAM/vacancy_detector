@@ -45,21 +45,23 @@ public:
     declare_parameter<std::string>("cloud_filter_enable_service",
                                    "/vision/table_cloud_filter/enable");
     declare_parameter<double>("start_height_m", 0.10);
-    declare_parameter<double>("front_margin_m", 0.15);
+    declare_parameter<double>("front_margin_m", 0.05);
     declare_parameter<double>("side_margin_m", 0.10);
     declare_parameter<double>("back_margin_m", 0.10);
-    declare_parameter<double>("obstacle_margin_m", 0.15);
+    declare_parameter<double>("obstacle_margin_m", 0.10);
     declare_parameter<double>("obstacle_min_height_m", 0.03);
     declare_parameter<double>("obstacle_max_height_m", 0.35);
     declare_parameter<double>("preferred_x_m", 0.0);
-    declare_parameter<int>("min_front_edge_points", 30);
-    declare_parameter<int>("min_front_edge_line_inliers", 20);
+    declare_parameter<double>("preferred_y_m", 0.08);
+    declare_parameter<double>("preferred_point_weight", 1.20);
+    declare_parameter<int>("min_front_edge_points", 12);
+    declare_parameter<int>("min_front_edge_line_inliers", 8);
     declare_parameter<double>("safe_x_min_m", 0.15);
-    declare_parameter<double>("safe_x_max_m", 1.20);
-    declare_parameter<double>("safe_abs_y_max_m", 0.80);
+    declare_parameter<double>("safe_x_max_m", 0.80);
+    declare_parameter<double>("safe_abs_y_max_m", 0.55);
     declare_parameter<double>("safe_z_min_m", 0.35);
     declare_parameter<double>("safe_z_max_m", 1.40);
-    declare_parameter<double>("safe_dist_xy_max_m", 1.40);
+    declare_parameter<double>("safe_dist_xy_max_m", 1.05);
     declare_parameter<double>("roi_x_min_m", -1.5);
     declare_parameter<double>("roi_x_max_m", 1.5);
     declare_parameter<double>("roi_y_min_m", -0.8);
@@ -633,6 +635,10 @@ private:
         static_cast<float>(get_parameter("obstacle_margin_m").as_double());
     const float preferred_x =
         static_cast<float>(get_parameter("preferred_x_m").as_double());
+    const float preferred_y_param =
+        static_cast<float>(get_parameter("preferred_y_m").as_double());
+    const float preferred_point_weight = static_cast<float>(
+        get_parameter("preferred_point_weight").as_double());
 
     const float ux_min = x_min + side_margin;
     const float ux_max = x_max - side_margin;
@@ -652,7 +658,8 @@ private:
       return false;
     }
 
-    const float preferred_y = (uy_min + uy_max) * 0.5f;
+    const float preferred_y =
+        std::clamp(preferred_y_param, uy_min, uy_max);
     const int grid_x = 15;
     const int grid_y = 15;
 
@@ -678,14 +685,16 @@ private:
 
         const float border_clearance =
             std::min({x - ux_min, ux_max - x, y - uy_min, uy_max - y});
-        const float center_cost = std::hypot(x - preferred_x, y - preferred_y);
+        const float preferred_point_cost =
+            std::hypot(x - preferred_x, y - preferred_y);
         const float obstacle_score =
             std::min(min_obstacle_distance, obstacle_margin * 2.0f);
 
         Candidate candidate;
         candidate.x = x;
         candidate.y = y;
-        candidate.score = border_clearance + obstacle_score - 0.25f * center_cost;
+        candidate.score = border_clearance + obstacle_score -
+                          preferred_point_weight * preferred_point_cost;
 
         if (!found || candidate.score > best.score) {
           best = candidate;
@@ -701,10 +710,12 @@ private:
       return false;
     }
 
-    RCLCPP_DEBUG(get_logger(),
-                 "[table_drop_tf] mejor candidato: local=(%.3f, %.3f) "
-                 "score=%.3f obstaculos=%zu",
-                 best.x, best.y, best.score, obstacles.size());
+    RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "[table_drop_tf] mejor candidato: local=(%.3f, %.3f) score=%.3f "
+        "preferido=(%.3f, %.3f) obstaculos=%zu",
+        best.x, best.y, best.score, preferred_x, preferred_y,
+        obstacles.size());
 
     return true;
   }

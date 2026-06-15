@@ -62,6 +62,7 @@ public:
     declare_parameter<double>("open_section_height_m", 0.45);
     declare_parameter<double>("preferred_section_z_m", -1.0);
     declare_parameter<double>("preferred_section_z_weight", 1.0);
+    declare_parameter<int>("preferred_section_rank", 0);
 
     declare_parameter<double>("start_height_m", 0.10);
     declare_parameter<double>("front_margin_m", 0.07);
@@ -486,9 +487,11 @@ private:
         get_parameter("preferred_section_z_m").as_double());
     const float preferred_z_weight = static_cast<float>(
         get_parameter("preferred_section_z_weight").as_double());
+    const int preferred_rank = get_parameter("preferred_section_rank").as_int();
 
     bool found = false;
     std::string first_reject;
+    std::vector<Section> valid_sections;
 
     for (const auto &floor : planes) {
       Section section;
@@ -527,6 +530,7 @@ private:
       if (preferred_z >= 0.0f) {
         section.score -= preferred_z_weight * std::fabs(floor.z - preferred_z);
       }
+      valid_sections.push_back(section);
 
       if (!found || section.score > best.score) {
         best = section;
@@ -539,6 +543,22 @@ private:
                   std::to_string(planes.size()) +
                   " first_reject=" + first_reject;
       return false;
+    }
+
+    if (preferred_rank > 0) {
+      std::sort(valid_sections.begin(), valid_sections.end(),
+                [](const Section &a, const Section &b) {
+                  return a.floor.z > b.floor.z;
+                });
+      const int index = std::min(preferred_rank,
+                                 static_cast<int>(valid_sections.size())) -
+                        1;
+      best = valid_sections[static_cast<std::size_t>(index)];
+      RCLCPP_INFO(get_logger(),
+                  "[shelf_drop_tf] seccion por nivel: rank=%d/%zu z=%.3f "
+                  "front=%.3f width=%.3f depth=%.3f height=%.3f",
+                  preferred_rank, valid_sections.size(), best.floor.z,
+                  best.floor.x_min, best.width, best.depth, best.height);
     }
     return true;
   }

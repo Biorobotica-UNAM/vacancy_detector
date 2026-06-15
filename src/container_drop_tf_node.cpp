@@ -10,6 +10,7 @@
 #include <memory>
 #include <numeric>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -63,9 +64,19 @@ public:
     declare_parameter<double>("container_max_width_m", 0.80);
     declare_parameter<double>("container_min_depth_m", 0.18);
     declare_parameter<double>("container_max_depth_m", 0.90);
+    declare_parameter<double>("partial_rim_min_depth_m", 0.05);
+    declare_parameter<int>("partial_rim_min_points", 500);
+    // Si solo se ve una franja del borde frontal, +X mueve el drop hacia el
+    // interior estimado de la cubeta, alejandolo del robot.
+    declare_parameter<double>("partial_rim_drop_x_offset_m", 0.12);
     declare_parameter<double>("rim_band_m", 0.055);
     declare_parameter<double>("min_wall_coverage", 0.45);
     declare_parameter<double>("max_interior_fill_ratio", 0.35);
+    declare_parameter<bool>("reject_full_containers", true);
+    declare_parameter<double>("full_container_fill_ratio", 0.85);
+    declare_parameter<double>("full_container_min_coverage", 0.30);
+    declare_parameter<std::string>("last_result", "idle");
+    declare_parameter<std::string>("last_error", "");
     // Altura extra sobre la superficie/borde detectado donde se dibuja y
     // publica container_drop_start. Subirlo ayuda a evitar colisiones.
     declare_parameter<double>("start_clearance_m", 0.10);
@@ -80,6 +91,10 @@ public:
     declare_parameter<bool>("override_drop_y", false);
     // Valor lateral absoluto usado cuando override_drop_y=true.
     declare_parameter<double>("drop_y_override_m", 0.0);
+    // Si es true, ignora la altura detectada y fuerza Z absoluta en base_link.
+    declare_parameter<bool>("override_drop_z", false);
+    // Valor Z absoluto usado cuando override_drop_z=true.
+    declare_parameter<double>("drop_z_override_m", 1.0);
     declare_parameter<double>("cluster_tolerance_m", 0.045);
     declare_parameter<int>("cluster_min_points", 80);
     declare_parameter<int>("cluster_max_points", 12000);
@@ -163,6 +178,7 @@ private:
     float coverage{0.0f};
     float interior_fill{1.0f};
     float score{-std::numeric_limits<float>::max()};
+    bool partial_rim{false};
   };
 
   struct ShapeScore {
@@ -224,12 +240,36 @@ private:
       return;
     }
 
+    if (container_rejected_this_activation_) {
+      RCLCPP_DEBUG_THROTTLE(
+          get_logger(), *get_clock(), 5000,
+          "[container_drop_tf] contenedor lleno ya rechazado en esta "
+          "activacion; ignorando nubes restantes");
+      return;
+    }
+
     std::string error;
     if (!prepareYoloRoiForCloud()) {
       return;
     }
     const bool used_yolo_roi = has_selected_yolo_roi_;
     if (!processCloud(*msg, error)) {
+      if (error.find("container_full") != std::string::npos) {
+        container_rejected_this_activation_ = true;
+        active_ = false;
+        yolo_request_failed_ = true;
+        has_selected_yolo_roi_ = false;
+        has_yolo_gate_roi_ = false;
+        set_parameter(rclcpp::Parameter("last_result", "container_full"));
+        set_parameter(rclcpp::Parameter("last_error", error));
+        setCloudFilterEnabled(false);
+        RCLCPP_WARN(get_logger(),
+                    "[container_drop_tf] contenedor lleno rechazado; se omiten "
+                    "expansiones ROI y procesamiento adicional: %s",
+                    error.c_str());
+        return;
+      }
+
       if (used_yolo_roi && get_parameter("fallback_without_yolo").as_bool()) {
         ++yolo_roi_failure_count_;
         const int max_failures =
@@ -261,6 +301,9 @@ private:
     active_ = request->data;
     if (active_) {
       drop_point_saved_this_activation_ = false;
+      container_rejected_this_activation_ = false;
+      set_parameter(rclcpp::Parameter("last_result", "running"));
+      set_parameter(rclcpp::Parameter("last_error", ""));
       // Cada escaneo debe iniciar sin esferas previas; si no, RViz muestra
       // puntos viejos mientras OWLv2 y la nube nueva todavia estan procesando.
       saved_drop_points_.clear();
@@ -270,6 +313,7 @@ private:
       resetYoloState();
       requestYoloDetections();
     } else {
+      set_parameter(rclcpp::Parameter("last_result", "disabled"));
       setCloudFilterEnabled(false);
     }
 
@@ -401,20 +445,54 @@ private:
                 "[container_drop_tf] YOLO detections=%zu message='%s'",
                 response->detections.size(), response->message.c_str());
 
+    std::unordered_map<std::string, int> class_counts;
     for (const auto &det : response->detections) {
       const double width = std::max(0.0, det.x_max - det.x_min);
       const double height = std::max(0.0, det.y_max - det.y_min);
       const double area = width * height;
       const double center_x = 0.5 * (det.x_min + det.x_max);
       const double center_offset = std::fabs(center_x - 320.0) / 320.0;
-      const double score = det.confidence + 0.00001 * area - 0.25 * center_offset;
+
+      std::string sanitized = det.class_name;
+      std::replace(sanitized.begin(), sanitized.end(), ' ', '_');
+      const int instance = class_counts[sanitized]++;
+      const std::string frame = "OWL_" + sanitized + "_" +
+                                std::to_string(instance);
+
+      bool has_tf = false;
+      double base_x = 0.0;
+      double base_y = 0.0;
+      try {
+        const auto tf = tf_buffer_->lookupTransform(
+            validation_frame_id_, frame, tf2::TimePointZero, 200ms);
+        has_tf = true;
+        base_x = tf.transform.translation.x;
+        base_y = tf.transform.translation.y;
+      } catch (const tf2::TransformException &ex) {
+        RCLCPP_DEBUG(get_logger(),
+                     "[container_drop_tf] YOLO det sin TF frame=%s error=%s",
+                     frame.c_str(), ex.what());
+      }
+
+      const double area_score = area / 10000.0;
+      const double distance_score =
+          has_tf ? (get_parameter("roi_x_max_m").as_double() - base_x) /
+                       std::max(0.001, get_parameter("roi_x_max_m").as_double() -
+                                           get_parameter("roi_x_min_m").as_double())
+                 : 0.0;
+      const double lateral_score =
+          has_tf ? -0.25 * std::fabs(base_y) : 0.0;
+      const double score = 0.35 * det.confidence + 1.35 * area_score +
+                           1.00 * distance_score + lateral_score -
+                           0.15 * center_offset;
 
       RCLCPP_INFO(
           get_logger(),
           "[container_drop_tf] YOLO det class='%s' conf=%.2f bbox=(%.0f %.0f "
-          "%.0f %.0f) area=%.0f score=%.3f",
+          "%.0f %.0f) area=%.0f frame=%s base=(%.3f %.3f) tf=%s score=%.3f",
           det.class_name.c_str(), det.confidence, det.x_min, det.y_min,
-          det.x_max, det.y_max, area, score);
+          det.x_max, det.y_max, area, frame.c_str(), base_x, base_y,
+          has_tf ? "true" : "false", score);
 
       if (det.confidence < min_conf || width < 5.0 || height < 5.0) {
         continue;
@@ -602,15 +680,19 @@ private:
     saveDropPoint(fixed_best.drop_start);
     publishMarkers();
     drop_point_saved_this_activation_ = true;
+    set_parameter(rclcpp::Parameter("last_result", "success"));
+    set_parameter(rclcpp::Parameter("last_error", ""));
     setCloudFilterEnabled(false);
 
     RCLCPP_INFO(
         get_logger(),
         "[container_drop_tf] TF %s publicada: base=(%.3f %.3f %.3f) "
-        "size=(%.3f %.3f %.3f) coverage=%.2f interior=%.2f score=%.2f",
+        "size=(%.3f %.3f %.3f) coverage=%.2f interior=%.2f score=%.2f "
+        "mode=%s",
         drop_start_frame_id_.c_str(), best.drop_start.x(),
         best.drop_start.y(), best.drop_start.z(), best.width, best.depth,
-        best.height, best.coverage, best.interior_fill, best.score);
+        best.height, best.coverage, best.interior_fill, best.score,
+        best.partial_rim ? "partial_rim" : "full");
 
     error_out.clear();
     return true;
@@ -1015,13 +1097,15 @@ private:
             "[container_drop_tf] cluster[%d] inseguro: puntos=%zu "
             "center=(%.3f %.3f %.3f) drop=(%.3f %.3f %.3f) "
             "size=(%.3f %.3f %.3f) coverage=%.2f interior=%.2f score=%.2f "
-            "reason=%s",
+            "mode=%s reason=%s",
             cluster_id, cluster.indices.size(), candidate.center_floor.x(),
             candidate.center_floor.y(), candidate.center_floor.z(),
             candidate.drop_start.x(), candidate.drop_start.y(),
             candidate.drop_start.z(), candidate.width, candidate.depth,
             candidate.height, candidate.coverage, candidate.interior_fill,
-            candidate.score, safety_reject.c_str());
+            candidate.score,
+            candidate.partial_rim ? "partial_rim" : "full",
+            safety_reject.c_str());
         if (reject_summary.empty()) {
           reject_summary = safety_reject;
         }
@@ -1033,13 +1117,15 @@ private:
           get_logger(),
           "[container_drop_tf] cluster[%d] candidato: puntos=%zu "
           "center=(%.3f %.3f %.3f) drop=(%.3f %.3f %.3f) "
-          "size=(%.3f %.3f %.3f) coverage=%.2f interior=%.2f score=%.2f",
+          "size=(%.3f %.3f %.3f) coverage=%.2f interior=%.2f score=%.2f "
+          "mode=%s",
           cluster_id, cluster.indices.size(), candidate.center_floor.x(),
           candidate.center_floor.y(), candidate.center_floor.z(),
           candidate.drop_start.x(), candidate.drop_start.y(),
           candidate.drop_start.z(), candidate.width, candidate.depth,
           candidate.height, candidate.coverage, candidate.interior_fill,
-          candidate.score);
+          candidate.score,
+          candidate.partial_rim ? "partial_rim" : "full");
 
       if (!found || candidate.score > best.score) {
         best = candidate;
@@ -1147,23 +1233,55 @@ private:
     const float max_height =
         static_cast<float>(get_parameter("object_max_height_m").as_double());
 
-    if (width < min_width || width > max_width || depth < min_depth ||
-        depth > max_depth || height < min_height || height > max_height) {
+    const float partial_min_depth = static_cast<float>(
+        get_parameter("partial_rim_min_depth_m").as_double());
+    const auto partial_min_points =
+        static_cast<std::size_t>(get_parameter("partial_rim_min_points").as_int());
+    const bool partial_rim_candidate =
+        width >= min_width && width <= max_width && depth >= partial_min_depth &&
+        depth < min_depth && height >= min_height && height <= max_height &&
+        indices.indices.size() >= partial_min_points;
+
+    if ((width < min_width || width > max_width || depth < min_depth ||
+         depth > max_depth || height < min_height || height > max_height) &&
+        !partial_rim_candidate) {
       reject_reason = "size_out_of_range width=" + std::to_string(width) +
                       " depth=" + std::to_string(depth) +
                       " height=" + std::to_string(height);
       return false;
     }
 
-    const ShapeScore shape =
-        scoreClosedFootprint(points, mean, axis_x, axis_y, min_lx, max_lx,
-                             min_ly, max_ly, floor_z, max_z);
+    ShapeScore shape;
+    if (partial_rim_candidate) {
+      shape.coverage = 0.65f;
+      shape.interior_fill = 0.0f;
+    } else {
+      shape = scoreClosedFootprint(points, mean, axis_x, axis_y, min_lx, max_lx,
+                                   min_ly, max_ly, floor_z, max_z);
+    }
 
     const float min_coverage =
         static_cast<float>(get_parameter("min_wall_coverage").as_double());
     const float max_fill = static_cast<float>(
         get_parameter("max_interior_fill_ratio").as_double());
-    if (shape.coverage < min_coverage || shape.interior_fill > max_fill) {
+    const bool reject_full_containers =
+        get_parameter("reject_full_containers").as_bool();
+    const float full_fill = static_cast<float>(
+        get_parameter("full_container_fill_ratio").as_double());
+    const float full_min_coverage = static_cast<float>(
+        get_parameter("full_container_min_coverage").as_double());
+    if (!partial_rim_candidate && reject_full_containers &&
+        shape.coverage >= full_min_coverage &&
+        shape.interior_fill >= full_fill) {
+      reject_reason = "container_full coverage=" +
+                      std::to_string(shape.coverage) +
+                      " interior_fill=" +
+                      std::to_string(shape.interior_fill);
+      return false;
+    }
+
+    if (!partial_rim_candidate &&
+        (shape.coverage < min_coverage || shape.interior_fill > max_fill)) {
       reject_reason = "shape_rejected coverage=" +
                       std::to_string(shape.coverage) +
                       " interior_fill=" +
@@ -1181,9 +1299,14 @@ private:
         static_cast<float>(get_parameter("drop_x_offset_m").as_double());
     const float drop_y_offset =
         static_cast<float>(get_parameter("drop_y_offset_m").as_double());
+    const float partial_drop_x_offset = static_cast<float>(
+        get_parameter("partial_rim_drop_x_offset_m").as_double());
     const bool override_drop_y = get_parameter("override_drop_y").as_bool();
     const float drop_y_override =
         static_cast<float>(get_parameter("drop_y_override_m").as_double());
+    const bool override_drop_z = get_parameter("override_drop_z").as_bool();
+    const float drop_z_override =
+        static_cast<float>(get_parameter("drop_z_override_m").as_double());
     // La esfera se calcula desde el centro detectado del cluster, luego se
     // corrige con offsets calibrables para colocarla dentro de la cubeta real.
     float drop_y = center_xy.y() + drop_y_offset;
@@ -1192,11 +1315,15 @@ private:
     }
     // El punto de drop queda sobre el centro del hueco, un poco arriba del
     // borde mas alto para iniciar la maniobra sin chocar con el contenedor.
+    const float final_drop_x =
+        center_xy.x() + drop_x_offset +
+        (partial_rim_candidate ? partial_drop_x_offset : 0.0f);
+
     candidate.center_floor = Eigen::Vector3f(center_xy.x(), center_xy.y(),
                                              floor_z);
-    candidate.drop_start =
-        Eigen::Vector3f(center_xy.x() + drop_x_offset, drop_y,
-                        max_z + clearance);
+    const float final_drop_z =
+        override_drop_z ? drop_z_override : max_z + clearance;
+    candidate.drop_start = Eigen::Vector3f(final_drop_x, drop_y, final_drop_z);
     candidate.axis_x = Eigen::Vector3f(axis_x.x(), axis_x.y(), 0.0f);
     candidate.axis_y = Eigen::Vector3f(axis_y.x(), axis_y.y(), 0.0f);
     candidate.axis_z = Eigen::Vector3f(0.0f, 0.0f, 1.0f);
@@ -1205,10 +1332,14 @@ private:
     candidate.height = height;
     candidate.coverage = shape.coverage;
     candidate.interior_fill = shape.interior_fill;
+    candidate.partial_rim = partial_rim_candidate;
     candidate.score = 2.0f * shape.coverage - shape.interior_fill +
                       0.4f * width + 0.3f * depth - 0.35f * height -
                       0.35f * std::fabs(center_xy.y()) -
                       0.15f * std::hypot(center_xy.x(), center_xy.y());
+    if (partial_rim_candidate) {
+      candidate.score -= 0.25f;
+    }
     return true;
   }
 
@@ -1551,6 +1682,7 @@ private:
   bool yolo_request_failed_{false};
   bool has_selected_yolo_roi_{false};
   bool has_yolo_gate_roi_{false};
+  bool container_rejected_this_activation_{false};
   bool active_{false};
 };
 
