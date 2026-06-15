@@ -458,7 +458,7 @@ private:
   }
 
   void extractClusters(const pcl::PointCloud<pcl::PointXYZ>::Ptr &cloud,
-                       std::vector<pcl::PointIndices> &clusters) const {
+                       std::vector<pcl::PointIndices> &clusters){
     // Cluster euclidiano: agrupa puntos cercanos en objetos independientes.
     // cluster_tolerance_m controla que tan separados pueden estar los puntos.
     pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(
