@@ -33,10 +33,6 @@ install(TARGETS
   vacancy_cloud_filter_node
   DESTINATION lib/${PROJECT_NAME})
 
-install(PROGRAMS
-  scripts/container_yolo_world_node.py
-  DESTINATION lib/${PROJECT_NAME})
-
 ament_target_dependencies(table_drop_tf_node
   rclcpp
   sensor_msgs
