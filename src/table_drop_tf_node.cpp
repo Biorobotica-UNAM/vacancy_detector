@@ -624,7 +624,7 @@ private:
 
   bool selectCandidate(float x_min, float x_max, float y_min, float y_max,
                        const std::vector<Eigen::Vector2f> &obstacles,
-                       Candidate &best, std::string &error_out) const {
+                       Candidate &best, std::string &error_out) {
     const float side_margin =
         static_cast<float>(get_parameter("side_margin_m").as_double());
     const float front_margin =

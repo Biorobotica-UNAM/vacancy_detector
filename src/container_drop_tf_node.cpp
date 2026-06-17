@@ -1535,7 +1535,7 @@ private:
   }
 
   void logCloudWindow(const pcl::PointCloud<pcl::PointXYZ>::Ptr &cloud,
-                      const std::string &label) const {
+                      const std::string &label) {
     if (!cloud || cloud->empty()) {
       RCLCPP_INFO_THROTTLE(
           get_logger(), *get_clock(), 1500,
