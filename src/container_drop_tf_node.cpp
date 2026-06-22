@@ -72,7 +72,10 @@ public:
     declare_parameter<double>("rim_band_m", 0.055);
     declare_parameter<double>("min_wall_coverage", 0.45);
     declare_parameter<double>("max_interior_fill_ratio", 0.35);
-    declare_parameter<bool>("reject_full_containers", true);
+    // Por ahora no bloqueamos la publicacion por "container_full".
+    // La geometria sigue calculando coverage/interior_fill, pero no aborta
+    // el drop mientras esta bandera este en false.
+    declare_parameter<bool>("reject_full_containers", false);
     declare_parameter<double>("full_container_fill_ratio", 0.85);
     declare_parameter<double>("full_container_min_coverage", 0.30);
     declare_parameter<std::string>("last_result", "idle");
@@ -92,7 +95,7 @@ public:
     // Valor lateral absoluto usado cuando override_drop_y=true.
     declare_parameter<double>("drop_y_override_m", 0.0);
     // Si es true, ignora la altura detectada y fuerza Z absoluta en base_link.
-    declare_parameter<bool>("override_drop_z", false);
+    declare_parameter<bool>("override_drop_z", true);
     // Valor Z absoluto usado cuando override_drop_z=true.
     declare_parameter<double>("drop_z_override_m", 1.0);
     declare_parameter<double>("cluster_tolerance_m", 0.045);
@@ -100,7 +103,7 @@ public:
     declare_parameter<int>("cluster_max_points", 12000);
     declare_parameter<double>("safe_x_min_m", 0.15);
     declare_parameter<double>("safe_x_max_m", 1.35);
-    declare_parameter<double>("safe_abs_y_max_m", 0.85);
+    declare_parameter<double>("safe_abs_y_max_m", 0.45);
     declare_parameter<double>("safe_z_min_m", 0.08);
     declare_parameter<double>("safe_z_max_m", 1.10);
     declare_parameter<double>("safe_dist_xy_max_m", 1.50);
@@ -122,6 +125,11 @@ public:
     declare_parameter<double>("yolo_pose_gate_abs_x_margin_m", 0.35);
     declare_parameter<double>("yolo_pose_gate_abs_y_margin_m", 0.25);
     declare_parameter<bool>("use_owl_pose_seed", true);
+    // La geometria debe buscar caracteristicas cerca de la TF OWL, no en toda
+    // la ROI global, para evitar clusters parecidos pero incorrectos.
+    declare_parameter<bool>("use_owl_guided_search_bounds", true);
+    declare_parameter<double>("owl_guided_search_x_margin_m", 0.38);
+    declare_parameter<double>("owl_guided_search_y_margin_m", 0.32);
     declare_parameter<double>("owl_seed_drop_x_offset_m", 0.0);
     declare_parameter<double>("owl_seed_drop_y_offset_m", 0.0);
     declare_parameter<double>("owl_seed_xy_refine_max_m", 0.12);
@@ -132,7 +140,10 @@ public:
     declare_parameter<double>("owl_seed_pair_fallback_x_offset_m", 0.0);
     declare_parameter<double>("owl_seed_fallback_y_offset_m", 0.0);
     declare_parameter<double>("owl_seed_fallback_z_extra_m", 0.02);
-    declare_parameter<double>("owl_seed_pair_max_separation_m", 0.45);
+    declare_parameter<double>("owl_seed_pair_max_separation_m", 0.70);
+    // Si la geometria no puede confirmar superficie/borde, usa la TF OWL o el
+    // punto medio entre dos TFs OWL como ultimo recurso seguro validado.
+    declare_parameter<bool>("force_owl_fallback_on_geometry_failure", true);
     declare_parameter<bool>("fallback_without_yolo", true);
     declare_parameter<bool>("active_on_start", false);
 
@@ -278,7 +289,9 @@ private:
     }
     const bool used_yolo_roi = has_selected_yolo_roi_;
     if (!processCloud(*msg, error)) {
-      if (error.find("container_full") != std::string::npos) {
+      const bool is_full = error.find("container_full") != std::string::npos;
+      const bool reject_full = get_parameter("reject_full_containers").as_bool();
+      if (is_full && reject_full) {
         container_rejected_this_activation_ = true;
         active_ = false;
         yolo_request_failed_ = true;
@@ -290,6 +303,15 @@ private:
         RCLCPP_WARN(get_logger(),
                     "[container_drop_tf] contenedor lleno rechazado; se omiten "
                     "expansiones ROI y procesamiento adicional: %s",
+                    error.c_str());
+        return;
+      }
+
+      if (get_parameter("force_owl_fallback_on_geometry_failure").as_bool() &&
+          publishOwlSeedFinalFallback(error)) {
+        RCLCPP_WARN(get_logger(),
+                    "[container_drop_tf] geometria fallo (%s); se publico "
+                    "fallback OWL validado",
                     error.c_str());
         return;
       }
@@ -633,7 +655,8 @@ private:
         new pcl::PointCloud<pcl::PointXYZ>);
     // La ROI reduce falsos positivos: buscamos contenedores bajos y cercanos,
     // no paredes, personas ni muebles fuera del alcance de drop.
-    applyRoi(validation_cloud, roi_cloud);
+    applyRoi(validation_cloud, roi_cloud,
+             yolo_gate_bounds.valid ? &yolo_gate_bounds : nullptr);
     publishDebugCloud(*roi_cloud, validation_frame_id_);
 
     RCLCPP_INFO_THROTTLE(
@@ -739,6 +762,7 @@ private:
     const double max_pair_separation =
         get_parameter("owl_seed_pair_max_separation_m").as_double();
     const ImageRoi *pair_roi = nullptr;
+    double best_pair_separation = 0.0;
     for (const auto &candidate_roi : owl_seed_rois_) {
       if (&candidate_roi == roi ||
           candidate_roi.class_name != roi->class_name ||
@@ -748,16 +772,20 @@ private:
       const double separation =
           std::hypot(candidate_roi.base_x - roi->base_x,
                      candidate_roi.base_y - roi->base_y);
-      if (separation < 0.01) {
+      if (separation < 0.01 || separation > max_pair_separation) {
         continue;
       }
-      if (separation <= max_pair_separation) {
+      // Si OWL ve frente y fondo del mismo contenedor, el par mas separado
+      // dentro del maximo suele representar mejor el eje front/back.
+      if (separation > best_pair_separation) {
         pair_roi = &candidate_roi;
-        seed_x = 0.5 * (roi->base_x + pair_roi->base_x);
-        seed_y = 0.5 * (roi->base_y + pair_roi->base_y);
-        seed_source = "pair_midpoint";
-        break;
+        best_pair_separation = separation;
       }
+    }
+    if (pair_roi != nullptr) {
+      seed_x = 0.5 * (roi->base_x + pair_roi->base_x);
+      seed_y = 0.5 * (roi->base_y + pair_roi->base_y);
+      seed_source = "pair_midpoint";
     }
 
     const double x_offset =
@@ -1115,11 +1143,41 @@ private:
            p.z() >= bounds.z_min && p.z() <= bounds.z_max;
   }
 
+  SearchBounds makeOwlGuidedSearchBounds(const SearchBounds &base_bounds,
+                                         const YoloGateBounds *gate) const {
+    SearchBounds bounds = base_bounds;
+    if (!get_parameter("use_owl_guided_search_bounds").as_bool() ||
+        gate == nullptr || !gate->has_pose_x || !gate->has_pose_y) {
+      return bounds;
+    }
+
+    const float x_margin = static_cast<float>(
+        get_parameter("owl_guided_search_x_margin_m").as_double());
+    const float y_margin = static_cast<float>(
+        get_parameter("owl_guided_search_y_margin_m").as_double());
+
+    bounds.x_min = std::max(bounds.x_min, gate->pose_x - x_margin);
+    bounds.x_max = std::min(bounds.x_max, gate->pose_x + x_margin);
+    bounds.y_min = std::max(bounds.y_min, gate->pose_y - y_margin);
+    bounds.y_max = std::min(bounds.y_max, gate->pose_y + y_margin);
+
+    RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 1500,
+        "[container_drop_tf] ROI 3D guiada por OWL class='%s' "
+        "seed=(%.3f %.3f) x=[%.3f %.3f] y=[%.3f %.3f]",
+        gate->class_name.c_str(), gate->pose_x, gate->pose_y, bounds.x_min,
+        bounds.x_max, bounds.y_min, bounds.y_max);
+    return bounds;
+  }
+
   void applyRoi(const pcl::PointCloud<pcl::PointXYZ>::Ptr &cloud,
-                pcl::PointCloud<pcl::PointXYZ>::Ptr &roi_cloud) const {
-    // Filtro rectangular en base_link. Los parametros se pueden ajustar desde
-    // launch si el robot debe buscar mas cerca/lejos o con otro campo lateral.
-    const SearchBounds search_bounds = readSearchBounds();
+                pcl::PointCloud<pcl::PointXYZ>::Ptr &roi_cloud,
+                const YoloGateBounds *gate = nullptr) const {
+    // Filtro rectangular en base_link. Si OWL ya ubico el contenedor,
+    // reducimos la busqueda alrededor de esa pose para extraer caracteristicas
+    // del objeto correcto, no para aceptar mas falsos positivos.
+    const SearchBounds search_bounds =
+        makeOwlGuidedSearchBounds(readSearchBounds(), gate);
     roi_cloud->points.reserve(cloud->size());
     for (const auto &pt : cloud->points) {
       const Eigen::Vector3f p(pt.x, pt.y, pt.z);
@@ -1818,6 +1876,8 @@ private:
     drop_tf.transform.translation.z = rel.dot(candidate.axis_z);
     drop_tf.transform.rotation.w = 1.0;
 
+    // Runtime TF dinamica: debe tener stamp fresco para que FindSpace pueda
+    // rechazar TFs viejas usando request_stamp.
     tf_broadcaster_->sendTransform(container_tf);
     tf_broadcaster_->sendTransform(drop_tf);
   }
