@@ -119,6 +119,12 @@ public:
     // este margen 3D permite aceptar candidatos un poco fuera de la caja
     // proyectada por ruido, calibracion o bbox demasiado ajustado.
     declare_parameter<double>("yolo_gate_margin_m", 0.12);
+    declare_parameter<double>("yolo_pose_gate_abs_x_margin_m", 0.35);
+    declare_parameter<double>("yolo_pose_gate_abs_y_margin_m", 0.25);
+    declare_parameter<bool>("use_owl_pose_seed", true);
+    declare_parameter<double>("owl_seed_drop_x_offset_m", 0.0);
+    declare_parameter<double>("owl_seed_drop_y_offset_m", 0.0);
+    declare_parameter<double>("owl_seed_xy_refine_max_m", 0.12);
     declare_parameter<bool>("fallback_without_yolo", true);
     declare_parameter<bool>("active_on_start", false);
 
@@ -201,6 +207,9 @@ private:
     int x_max{0};
     int y_max{0};
     double confidence{0.0};
+    bool has_base_pose{false};
+    double base_x{0.0};
+    double base_y{0.0};
     std::string class_name;
   };
 
@@ -213,6 +222,12 @@ private:
     float max_y{-std::numeric_limits<float>::max()};
     float min_z{std::numeric_limits<float>::max()};
     float max_z{-std::numeric_limits<float>::max()};
+    bool has_pose_x{false};
+    float pose_x{0.0f};
+    float pose_abs_x_margin{0.0f};
+    bool has_pose_y{false};
+    float pose_y{0.0f};
+    float pose_abs_y_margin{0.0f};
     std::string class_name;
   };
 
@@ -510,6 +525,9 @@ private:
         best.y_min = best.base_y_min;
         best.x_max = best.base_x_max;
         best.y_max = best.base_y_max;
+        best.has_base_pose = has_tf;
+        best.base_x = base_x;
+        best.base_y = base_y;
         found = true;
       }
     }
@@ -664,6 +682,8 @@ private:
                                                     : nullptr)) {
       return false;
     }
+    refineCandidateWithOwlPoseSeed(
+        best, yolo_gate_bounds.valid ? &yolo_gate_bounds : nullptr);
 
     if (!validateDropStartPose(best.drop_start, error_out)) {
       return false;
@@ -840,6 +860,30 @@ private:
             : cloud->size();
     validation_cloud->points.reserve(reserve_size);
     const SearchBounds search_bounds = readSearchBounds();
+    const auto seed_pose_y_gate = [&](const ImageRoi *roi) {
+      if (roi == nullptr || !roi->has_base_pose) {
+        return;
+      }
+      const float x_margin = static_cast<float>(
+          get_parameter("yolo_pose_gate_abs_x_margin_m").as_double());
+      const float y_margin = static_cast<float>(
+          get_parameter("yolo_pose_gate_abs_y_margin_m").as_double());
+      gate_bounds.valid = true;
+      gate_bounds.has_pose_x = true;
+      gate_bounds.pose_x = static_cast<float>(roi->base_x);
+      gate_bounds.pose_abs_x_margin = x_margin;
+      gate_bounds.has_pose_y = true;
+      gate_bounds.pose_y = static_cast<float>(roi->base_y);
+      gate_bounds.pose_abs_y_margin = y_margin;
+      gate_bounds.class_name = roi->class_name;
+      gate_bounds.min_x = search_bounds.x_min;
+      gate_bounds.max_x = search_bounds.x_max;
+      gate_bounds.min_y = search_bounds.y_min;
+      gate_bounds.max_y = search_bounds.y_max;
+      gate_bounds.min_z = search_bounds.z_min;
+      gate_bounds.max_z = search_bounds.z_max;
+    };
+    seed_pose_y_gate(image_roi != nullptr ? image_roi : gate_roi);
 
     const auto update_gate_bounds = [&](const Eigen::Vector3f &p) {
       if (!isInsideSearchBounds(p, search_bounds)) {
@@ -1163,6 +1207,54 @@ private:
                       std::to_string(margin);
       return false;
     }
+    if (gate.has_pose_x &&
+        std::fabs(x - gate.pose_x) > gate.pose_abs_x_margin) {
+      reject_reason =
+          "outside_yolo_pose_x_gate class=" + gate.class_name +
+          " center_x=" + std::to_string(x) +
+          " yolo_x=" + std::to_string(gate.pose_x) +
+          " margin=" + std::to_string(gate.pose_abs_x_margin);
+      return false;
+    }
+    if (gate.has_pose_y &&
+        std::fabs(y - gate.pose_y) > gate.pose_abs_y_margin) {
+      reject_reason =
+          "outside_yolo_pose_y_gate class=" + gate.class_name +
+          " center_y=" + std::to_string(y) +
+          " yolo_y=" + std::to_string(gate.pose_y) +
+          " margin=" + std::to_string(gate.pose_abs_y_margin);
+      return false;
+    }
+    return true;
+  }
+
+  bool refineCandidateWithOwlPoseSeed(Candidate &candidate,
+                                      const YoloGateBounds *gate) const {
+    if (!get_parameter("use_owl_pose_seed").as_bool() || gate == nullptr ||
+        !gate->has_pose_x || !gate->has_pose_y) {
+      return false;
+    }
+
+    const float seed_x = gate->pose_x + static_cast<float>(
+                                         get_parameter("owl_seed_drop_x_offset_m")
+                                             .as_double());
+    const float seed_y = gate->pose_y + static_cast<float>(
+                                         get_parameter("owl_seed_drop_y_offset_m")
+                                             .as_double());
+    const float refine_max = static_cast<float>(
+        std::max(0.0, get_parameter("owl_seed_xy_refine_max_m").as_double()));
+    const float old_x = candidate.drop_start.x();
+    const float old_y = candidate.drop_start.y();
+    candidate.drop_start.x() =
+        seed_x + std::clamp(old_x - seed_x, -refine_max, refine_max);
+    candidate.drop_start.y() =
+        seed_y + std::clamp(old_y - seed_y, -refine_max, refine_max);
+
+    RCLCPP_INFO(get_logger(),
+                "[container_drop_tf] OWL seed refine: seed=(%.3f %.3f) "
+                "cloud_drop=(%.3f %.3f) refined=(%.3f %.3f) max=%.3f",
+                seed_x, seed_y, old_x, old_y, candidate.drop_start.x(),
+                candidate.drop_start.y(), refine_max);
     return true;
   }
 
