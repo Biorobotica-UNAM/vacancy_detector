@@ -86,6 +86,14 @@ public:
     // Desplazamiento frontal del punto de esfera/drop. En base_link, +X mueve
     // la marca hacia el interior/lejos del robot; -X la acerca al robot.
     declare_parameter<double>("drop_x_offset_m", 0.0);
+    // Si esta activo, la geometria coloca drop_x desde el borde con menor X
+    // visto en la nube, que corresponde al borde mas cercano al robot.
+    declare_parameter<bool>("prefer_near_edge_drop", true);
+    // Margen hacia adentro desde el borde cercano detectado.
+    declare_parameter<double>("near_edge_drop_inset_m", 0.10);
+    // Mantiene el X basado en borde cercano cuando OWL refina la marca; OWL
+    // sigue acotando Y para no irse a otro objeto lateral.
+    declare_parameter<bool>("preserve_near_edge_drop_x", true);
     // Desplazamiento lateral relativo del punto de esfera/drop. En base_link,
     // +Y mueve la marca a la izquierda del robot; -Y a la derecha.
     declare_parameter<double>("drop_y_offset_m", 0.0);
@@ -144,6 +152,10 @@ public:
     // Si la geometria no puede confirmar superficie/borde, usa la TF OWL o el
     // punto medio entre dos TFs OWL como ultimo recurso seguro validado.
     declare_parameter<bool>("force_owl_fallback_on_geometry_failure", true);
+    declare_parameter<bool>("use_owl_guided_geometry_fallback", true);
+    declare_parameter<double>("owl_guided_geometry_window_x_m", 0.35);
+    declare_parameter<double>("owl_guided_geometry_window_y_m", 0.28);
+    declare_parameter<int>("owl_guided_geometry_min_points", 25);
     declare_parameter<bool>("fallback_without_yolo", true);
     declare_parameter<bool>("active_on_start", false);
 
@@ -656,6 +668,202 @@ private:
                 selected_yolo_roi_.y_max);
   }
 
+  bool selectOwlSeed(double &seed_x, double &seed_y,
+                     const ImageRoi *&roi, const ImageRoi *&pair_roi,
+                     std::string &seed_source) const {
+    roi = nullptr;
+    pair_roi = nullptr;
+    seed_source = "single";
+    if (has_selected_yolo_roi_ && selected_yolo_roi_.has_base_pose) {
+      roi = &selected_yolo_roi_;
+    } else if (has_yolo_gate_roi_ && yolo_gate_roi_.has_base_pose) {
+      roi = &yolo_gate_roi_;
+    }
+    if (roi == nullptr) {
+      return false;
+    }
+
+    seed_x = roi->base_x;
+    seed_y = roi->base_y;
+    const double max_pair_separation =
+        get_parameter("owl_seed_pair_max_separation_m").as_double();
+    double best_pair_separation = 0.0;
+    for (const auto &candidate_roi : owl_seed_rois_) {
+      if (&candidate_roi == roi ||
+          candidate_roi.class_name != roi->class_name ||
+          !candidate_roi.has_base_pose) {
+        continue;
+      }
+      const double separation =
+          std::hypot(candidate_roi.base_x - roi->base_x,
+                     candidate_roi.base_y - roi->base_y);
+      if (separation < 0.01 || separation > max_pair_separation) {
+        continue;
+      }
+      if (separation > best_pair_separation) {
+        pair_roi = &candidate_roi;
+        best_pair_separation = separation;
+      }
+    }
+    if (pair_roi != nullptr) {
+      seed_x = 0.5 * (roi->base_x + pair_roi->base_x);
+      seed_y = 0.5 * (roi->base_y + pair_roi->base_y);
+      seed_source = "pair_midpoint";
+    }
+    return true;
+  }
+
+  bool publishOwlGuidedGeometryFallback(
+      const pcl::PointCloud<pcl::PointXYZ>::Ptr &support_cloud,
+      const std::string &last_error) {
+    if (!get_parameter("use_owl_guided_geometry_fallback").as_bool()) {
+      return false;
+    }
+
+    double seed_x = 0.0;
+    double seed_y = 0.0;
+    const ImageRoi *roi = nullptr;
+    const ImageRoi *pair_roi = nullptr;
+    std::string seed_source;
+    if (!selectOwlSeed(seed_x, seed_y, roi, pair_roi, seed_source)) {
+      RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "[container_drop_tf] fallback geometrico guiado por OWL no "
+          "disponible: sin TF base_link de OWL last_error=%s",
+          last_error.c_str());
+      return false;
+    }
+
+    const float window_x = static_cast<float>(
+        get_parameter("owl_guided_geometry_window_x_m").as_double());
+    const float window_y = static_cast<float>(
+        get_parameter("owl_guided_geometry_window_y_m").as_double());
+    const int min_points =
+        get_parameter("owl_guided_geometry_min_points").as_int();
+    const float seed_x_f = static_cast<float>(seed_x);
+    const float seed_y_f = static_cast<float>(seed_y);
+
+    int local_points = 0;
+    Eigen::Vector3f sum(0.0f, 0.0f, 0.0f);
+    Eigen::Vector3f min_pt(std::numeric_limits<float>::max(),
+                           std::numeric_limits<float>::max(),
+                           std::numeric_limits<float>::max());
+    Eigen::Vector3f max_pt(-std::numeric_limits<float>::max(),
+                           -std::numeric_limits<float>::max(),
+                           -std::numeric_limits<float>::max());
+    if (support_cloud) {
+      for (const auto &pt : support_cloud->points) {
+        if (!std::isfinite(pt.x) || !std::isfinite(pt.y) ||
+            !std::isfinite(pt.z)) {
+          continue;
+        }
+        if (std::fabs(pt.x - seed_x_f) > window_x ||
+            std::fabs(pt.y - seed_y_f) > window_y) {
+          continue;
+        }
+        const Eigen::Vector3f p(pt.x, pt.y, pt.z);
+        sum += p;
+        min_pt = min_pt.cwiseMin(p);
+        max_pt = max_pt.cwiseMax(p);
+        ++local_points;
+      }
+    }
+
+    const bool has_local_geometry = local_points >= min_points;
+    double refined_x = seed_x;
+    double refined_y = seed_y;
+    if (has_local_geometry) {
+      const Eigen::Vector3f mean = sum / static_cast<float>(local_points);
+      const double legacy_refine_max =
+          std::max(0.0, get_parameter("owl_seed_xy_refine_max_m").as_double());
+      const double configured_refine_max_x =
+          get_parameter("owl_seed_refine_max_x_m").as_double();
+      const double configured_refine_max_y =
+          get_parameter("owl_seed_refine_max_y_m").as_double();
+      const double refine_max_x =
+          configured_refine_max_x >= 0.0 ? configured_refine_max_x
+                                         : legacy_refine_max;
+      const double refine_max_y =
+          configured_refine_max_y >= 0.0 ? configured_refine_max_y
+                                         : legacy_refine_max;
+      refined_x =
+          seed_x + std::clamp(static_cast<double>(mean.x()) - seed_x,
+                              -refine_max_x, refine_max_x);
+      refined_y =
+          seed_y + std::clamp(static_cast<double>(mean.y()) - seed_y,
+                              -refine_max_y, refine_max_y);
+    }
+
+    const double x_offset =
+        pair_roi != nullptr
+            ? get_parameter("owl_seed_pair_fallback_x_offset_m").as_double()
+            : get_parameter("owl_seed_fallback_x_offset_m").as_double();
+    double drop_x = refined_x + x_offset;
+    if (has_local_geometry && get_parameter("prefer_near_edge_drop").as_bool()) {
+      drop_x = static_cast<double>(min_pt.x()) +
+               get_parameter("near_edge_drop_inset_m").as_double();
+    }
+    const float x = static_cast<float>(drop_x);
+    const float y = static_cast<float>(
+        refined_y + get_parameter("owl_seed_fallback_y_offset_m").as_double());
+    const double base_z = get_parameter("drop_z_override_m").as_double();
+    const double z_extra =
+        get_parameter("owl_seed_fallback_z_extra_m").as_double();
+    const double z_min = get_parameter("safe_z_min_m").as_double();
+    const double z_max = get_parameter("safe_z_max_m").as_double();
+    const float z =
+        static_cast<float>(std::clamp(base_z + z_extra, z_min, z_max));
+
+    Candidate candidate;
+    candidate.center_floor =
+        Eigen::Vector3f(x, y, has_local_geometry ? min_pt.z() : 0.0f);
+    candidate.drop_start = Eigen::Vector3f(x, y, z);
+    candidate.axis_x = Eigen::Vector3f(1.0f, 0.0f, 0.0f);
+    candidate.axis_y = Eigen::Vector3f(0.0f, 1.0f, 0.0f);
+    candidate.axis_z = Eigen::Vector3f(0.0f, 0.0f, 1.0f);
+    if (has_local_geometry) {
+      candidate.width = max_pt.x() - min_pt.x();
+      candidate.depth = max_pt.y() - min_pt.y();
+      candidate.height = max_pt.z() - min_pt.z();
+      candidate.coverage = 0.25f;
+      candidate.interior_fill = 0.0f;
+      candidate.score = 0.15f;
+    }
+
+    RCLCPP_WARN(
+        get_logger(),
+        "[container_drop_tf] marca OWL guiada por geometria: class='%s' "
+        "source=%s bbox_px=(%.0f %.0f) owl_seed=(%.3f %.3f) "
+        "refined=(%.3f %.3f) local_points=%d/%d "
+        "near_edge_x=%.3f inset=%.3f "
+        "local_xyz=[%.3f %.3f %.3f -> %.3f %.3f %.3f] "
+        "drop=(%.3f %.3f %.3f) motivo_geometria=%s",
+        roi->class_name.c_str(), seed_source.c_str(), roi->bbox_width,
+        roi->bbox_height, seed_x, seed_y, refined_x, refined_y, local_points,
+        min_points, has_local_geometry ? min_pt.x() : 0.0f,
+        get_parameter("near_edge_drop_inset_m").as_double(),
+        has_local_geometry ? min_pt.x() : 0.0f,
+        has_local_geometry ? min_pt.y() : 0.0f,
+        has_local_geometry ? min_pt.z() : 0.0f,
+        has_local_geometry ? max_pt.x() : 0.0f,
+        has_local_geometry ? max_pt.y() : 0.0f,
+        has_local_geometry ? max_pt.z() : 0.0f, candidate.drop_start.x(),
+        candidate.drop_start.y(), candidate.drop_start.z(),
+        last_error.c_str());
+
+    std::string publish_error;
+    if (!publishValidatedCandidate(candidate, "owl_guided_geometry_fallback",
+                                   publish_error)) {
+      RCLCPP_WARN(get_logger(),
+                  "[container_drop_tf] marca OWL guiada rechazada: %s "
+                  "consejo=%s",
+                  publish_error.c_str(), adviceForRejectReason(publish_error));
+      set_parameter(rclcpp::Parameter("last_error", publish_error));
+      return false;
+    }
+    return true;
+  }
+
   bool processCloud(const sensor_msgs::msg::PointCloud2 &input_msg,
                     std::string &error_out) {
     // Secuencia principal:
@@ -707,6 +915,9 @@ private:
     if (roi_cloud->size() < 500) {
       error_out = "insufficient_points_after_roi count=" +
                   std::to_string(roi_cloud->size());
+      if (publishOwlGuidedGeometryFallback(roi_cloud, error_out)) {
+        return true;
+      }
       return false;
     }
 
@@ -716,6 +927,9 @@ private:
     // El piso es la referencia para medir altura real del contenedor.
     if (!segmentFloor(roi_cloud, floor_coefficients, floor_inliers,
                       error_out)) {
+      if (publishOwlGuidedGeometryFallback(roi_cloud, error_out)) {
+        return true;
+      }
       return false;
     }
 
@@ -748,6 +962,9 @@ private:
     if (above_floor_cloud->size() < 100) {
       error_out = "insufficient_object_points count=" +
                   std::to_string(above_floor_cloud->size());
+      if (publishOwlGuidedGeometryFallback(roi_cloud, error_out)) {
+        return true;
+      }
       return false;
     }
 
@@ -756,6 +973,9 @@ private:
     extractClusters(above_floor_cloud, clusters);
     if (clusters.empty()) {
       error_out = "no_clusters_above_floor";
+      if (publishOwlGuidedGeometryFallback(roi_cloud, error_out)) {
+        return true;
+      }
       return false;
     }
 
@@ -765,6 +985,9 @@ private:
                              error_out,
                              yolo_gate_bounds.valid ? &yolo_gate_bounds
                                                     : nullptr)) {
+      if (publishOwlGuidedGeometryFallback(roi_cloud, error_out)) {
+        return true;
+      }
       return false;
     }
     refineCandidateWithOwlPoseSeed(
@@ -1535,8 +1758,11 @@ private:
                                        : legacy_refine_max);
     const float old_x = candidate.drop_start.x();
     const float old_y = candidate.drop_start.y();
-    candidate.drop_start.x() =
-        seed_x + std::clamp(old_x - seed_x, -refine_max_x, refine_max_x);
+    if (!get_parameter("prefer_near_edge_drop").as_bool() ||
+        !get_parameter("preserve_near_edge_drop_x").as_bool()) {
+      candidate.drop_start.x() =
+          seed_x + std::clamp(old_x - seed_x, -refine_max_x, refine_max_x);
+    }
     candidate.drop_start.y() =
         seed_y + std::clamp(old_y - seed_y, -refine_max_y, refine_max_y);
 
@@ -1563,10 +1789,12 @@ private:
     }
 
     Eigen::Vector2f mean(0.0f, 0.0f);
+    float min_base_x = std::numeric_limits<float>::max();
     float min_z = std::numeric_limits<float>::max();
     float max_z = -std::numeric_limits<float>::max();
     for (const auto &p : points) {
       mean += Eigen::Vector2f(p.x(), p.y());
+      min_base_x = std::min(min_base_x, p.x());
       min_z = std::min(min_z, p.z());
       max_z = std::max(max_z, p.z());
     }
@@ -1680,6 +1908,10 @@ private:
         static_cast<float>(get_parameter("start_clearance_m").as_double());
     const float drop_x_offset =
         static_cast<float>(get_parameter("drop_x_offset_m").as_double());
+    const bool prefer_near_edge_drop =
+        get_parameter("prefer_near_edge_drop").as_bool();
+    const float near_edge_drop_inset = static_cast<float>(
+        get_parameter("near_edge_drop_inset_m").as_double());
     const float drop_y_offset =
         static_cast<float>(get_parameter("drop_y_offset_m").as_double());
     const float partial_drop_x_offset = static_cast<float>(
@@ -1696,11 +1928,14 @@ private:
     if (override_drop_y) {
       drop_y = drop_y_override;
     }
-    // El punto de drop queda sobre el centro del hueco, un poco arriba del
-    // borde mas alto para iniciar la maniobra sin chocar con el contenedor.
-    const float final_drop_x =
+    // El punto de drop queda un poco hacia adentro del borde mas cercano al
+    // robot. Si se desactiva ese modo, se conserva el centro geometrico.
+    float final_drop_x =
         center_xy.x() + drop_x_offset +
         (partial_rim_candidate ? partial_drop_x_offset : 0.0f);
+    if (prefer_near_edge_drop) {
+      final_drop_x = min_base_x + near_edge_drop_inset;
+    }
 
     candidate.center_floor = Eigen::Vector3f(center_xy.x(), center_xy.y(),
                                              floor_z);
