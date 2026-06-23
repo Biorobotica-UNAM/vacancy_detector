@@ -344,7 +344,7 @@ private:
     }
 
     if (log_change) {
-      RCLCPP_INFO(
+      RCLCPP_DEBUG(
         get_logger(),
         "[vacancy_cloud_filter] %s profile=%s",
         enabled_ ? "enabled" : "disabled",
@@ -365,7 +365,7 @@ private:
   void send_nav_cloud_filter_enable(bool enabled)
   {
     if (!nav_cloud_filter_client_->service_is_ready()) {
-      RCLCPP_WARN_THROTTLE(
+      RCLCPP_DEBUG_THROTTLE(
         get_logger(), *get_clock(), 3000,
         "[vacancy_cloud_filter] nav cloud_filter service not ready: %s",
         nav_cloud_filter_enable_service_.c_str());
@@ -629,14 +629,14 @@ private:
     output.is_dense = false;
     pub_cloud_->publish(output);
     if (accepted_points == 0) {
-      RCLCPP_INFO_THROTTLE(
+      RCLCPP_DEBUG_THROTTLE(
         get_logger(), *get_clock(), 1500,
         "[vacancy_cloud_filter] organized profile=%s input=%zu finite=%zu "
         "accepted=0 roi_x=[%.2f %.2f] roi_y=[%.2f %.2f] roi_z=[%.2f %.2f]",
         profile_.c_str(), total_points, finite_points,
         roi_x_min_, roi_x_max_, roi_y_min_, roi_y_max_, roi_z_min_, roi_z_max_);
     } else {
-      RCLCPP_INFO_THROTTLE(
+      RCLCPP_DEBUG_THROTTLE(
         get_logger(), *get_clock(), 1500,
         "[vacancy_cloud_filter] organized profile=%s input=%zu finite=%zu "
         "accepted=%zu base_window x=[%.3f %.3f] y=[%.3f %.3f] z=[%.3f %.3f] "
@@ -789,7 +789,7 @@ private:
     }
 
     publish_compact_cloud(*msg, accepted);
-    RCLCPP_INFO_THROTTLE(
+    RCLCPP_DEBUG_THROTTLE(
       get_logger(), *get_clock(), 1500,
       "[vacancy_cloud_filter] compact profile=%s input=%zu voxels=%zu "
       "accepted=%zu roi_x=[%.2f %.2f] roi_y=[%.2f %.2f] roi_z=[%.2f %.2f] "
