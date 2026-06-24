@@ -55,10 +55,10 @@ public:
     declare_parameter<std::string>("nav_obstacle_detector_node", "/navigation/obstacle_detector");
     declare_parameter<std::string>(
       "nav_potential_fields_enable_topic",
-      "/navigation/navigation/potential_fields/enable");
+      "/navigation/potential_fields/enable");
     declare_parameter<std::string>(
       "nav_potential_fields_enable_cloud_topic",
-      "/navigation/navigation/potential_fields/enable_cloud");
+      "/navigation/potential_fields/enable_cloud");
     declare_parameter<bool>("pause_nav_lidar", true);
     declare_parameter<bool>("restore_use_point_cloud_default", true);
     declare_parameter<bool>("restore_use_lidar_default", true);
