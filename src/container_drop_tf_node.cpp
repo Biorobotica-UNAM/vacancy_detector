@@ -1403,7 +1403,7 @@ private:
   }
 
   SearchBounds makeOwlGuidedSearchBounds(const SearchBounds &base_bounds,
-                                         const YoloGateBounds *gate) const {
+                                         const YoloGateBounds *gate) {
     SearchBounds bounds = base_bounds;
     if (!get_parameter("use_owl_guided_search_bounds").as_bool() ||
         gate == nullptr || !gate->has_pose_x || !gate->has_pose_y) {
@@ -1429,9 +1429,11 @@ private:
     return bounds;
   }
 
+
+  //CAMARAAA, esto ya lo habia corregido!!!!
   void applyRoi(const pcl::PointCloud<pcl::PointXYZ>::Ptr &cloud,
                 pcl::PointCloud<pcl::PointXYZ>::Ptr &roi_cloud,
-                const YoloGateBounds *gate = nullptr) const {
+                const YoloGateBounds *gate = nullptr) {
     // Filtro rectangular en base_link. Si OWL ya ubico el contenedor,
     // reducimos la busqueda alrededor de esa pose para extraer caracteristicas
     // del objeto correcto, no para aceptar mas falsos positivos.
