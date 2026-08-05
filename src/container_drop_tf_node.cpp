@@ -72,7 +72,10 @@ public:
     declare_parameter<double>("rim_band_m", 0.055);
     declare_parameter<double>("min_wall_coverage", 0.45);
     declare_parameter<double>("max_interior_fill_ratio", 0.35);
-    declare_parameter<bool>("reject_full_containers", true);
+    // Por ahora no bloqueamos la publicacion por "container_full".
+    // La geometria sigue calculando coverage/interior_fill, pero no aborta
+    // el drop mientras esta bandera este en false.
+    declare_parameter<bool>("reject_full_containers", false);
     declare_parameter<double>("full_container_fill_ratio", 0.85);
     declare_parameter<double>("full_container_min_coverage", 0.30);
     declare_parameter<std::string>("last_result", "idle");
@@ -83,6 +86,14 @@ public:
     // Desplazamiento frontal del punto de esfera/drop. En base_link, +X mueve
     // la marca hacia el interior/lejos del robot; -X la acerca al robot.
     declare_parameter<double>("drop_x_offset_m", 0.0);
+    // Si esta activo, la geometria coloca drop_x desde el borde con menor X
+    // visto en la nube, que corresponde al borde mas cercano al robot.
+    declare_parameter<bool>("prefer_near_edge_drop", true);
+    // Margen hacia adentro desde el borde cercano detectado.
+    declare_parameter<double>("near_edge_drop_inset_m", 0.10);
+    // Mantiene el X basado en borde cercano cuando OWL refina la marca; OWL
+    // sigue acotando Y para no irse a otro objeto lateral.
+    declare_parameter<bool>("preserve_near_edge_drop_x", true);
     // Desplazamiento lateral relativo del punto de esfera/drop. En base_link,
     // +Y mueve la marca a la izquierda del robot; -Y a la derecha.
     declare_parameter<double>("drop_y_offset_m", 0.0);
@@ -92,7 +103,7 @@ public:
     // Valor lateral absoluto usado cuando override_drop_y=true.
     declare_parameter<double>("drop_y_override_m", 0.0);
     // Si es true, ignora la altura detectada y fuerza Z absoluta en base_link.
-    declare_parameter<bool>("override_drop_z", false);
+    declare_parameter<bool>("override_drop_z", true);
     // Valor Z absoluto usado cuando override_drop_z=true.
     declare_parameter<double>("drop_z_override_m", 1.0);
     declare_parameter<double>("cluster_tolerance_m", 0.045);
@@ -100,7 +111,7 @@ public:
     declare_parameter<int>("cluster_max_points", 12000);
     declare_parameter<double>("safe_x_min_m", 0.15);
     declare_parameter<double>("safe_x_max_m", 1.35);
-    declare_parameter<double>("safe_abs_y_max_m", 0.85);
+    declare_parameter<double>("safe_abs_y_max_m", 0.45);
     declare_parameter<double>("safe_z_min_m", 0.08);
     declare_parameter<double>("safe_z_max_m", 1.10);
     declare_parameter<double>("safe_dist_xy_max_m", 1.50);
@@ -119,6 +130,32 @@ public:
     // este margen 3D permite aceptar candidatos un poco fuera de la caja
     // proyectada por ruido, calibracion o bbox demasiado ajustado.
     declare_parameter<double>("yolo_gate_margin_m", 0.12);
+    declare_parameter<double>("yolo_pose_gate_abs_x_margin_m", 0.35);
+    declare_parameter<double>("yolo_pose_gate_abs_y_margin_m", 0.25);
+    declare_parameter<bool>("use_owl_pose_seed", true);
+    // La geometria debe buscar caracteristicas cerca de la TF OWL, no en toda
+    // la ROI global, para evitar clusters parecidos pero incorrectos.
+    declare_parameter<bool>("use_owl_guided_search_bounds", true);
+    declare_parameter<double>("owl_guided_search_x_margin_m", 0.38);
+    declare_parameter<double>("owl_guided_search_y_margin_m", 0.32);
+    declare_parameter<double>("owl_seed_drop_x_offset_m", 0.0);
+    declare_parameter<double>("owl_seed_drop_y_offset_m", 0.0);
+    declare_parameter<double>("owl_seed_xy_refine_max_m", 0.12);
+    declare_parameter<double>("owl_seed_refine_max_x_m", -1.0);
+    declare_parameter<double>("owl_seed_refine_max_y_m", -1.0);
+    declare_parameter<bool>("use_owl_seed_final_fallback", true);
+    declare_parameter<double>("owl_seed_fallback_x_offset_m", 0.10);
+    declare_parameter<double>("owl_seed_pair_fallback_x_offset_m", 0.0);
+    declare_parameter<double>("owl_seed_fallback_y_offset_m", 0.0);
+    declare_parameter<double>("owl_seed_fallback_z_extra_m", 0.02);
+    declare_parameter<double>("owl_seed_pair_max_separation_m", 0.70);
+    // Si la geometria no puede confirmar superficie/borde, usa la TF OWL o el
+    // punto medio entre dos TFs OWL como ultimo recurso seguro validado.
+    declare_parameter<bool>("force_owl_fallback_on_geometry_failure", true);
+    declare_parameter<bool>("use_owl_guided_geometry_fallback", true);
+    declare_parameter<double>("owl_guided_geometry_window_x_m", 0.35);
+    declare_parameter<double>("owl_guided_geometry_window_y_m", 0.28);
+    declare_parameter<int>("owl_guided_geometry_min_points", 25);
     declare_parameter<bool>("fallback_without_yolo", true);
     declare_parameter<bool>("active_on_start", false);
 
@@ -201,6 +238,12 @@ private:
     int x_max{0};
     int y_max{0};
     double confidence{0.0};
+    double score{0.0};
+    double bbox_width{0.0};
+    double bbox_height{0.0};
+    bool has_base_pose{false};
+    double base_x{0.0};
+    double base_y{0.0};
     std::string class_name;
   };
 
@@ -213,6 +256,12 @@ private:
     float max_y{-std::numeric_limits<float>::max()};
     float min_z{std::numeric_limits<float>::max()};
     float max_z{-std::numeric_limits<float>::max()};
+    bool has_pose_x{false};
+    float pose_x{0.0f};
+    float pose_abs_x_margin{0.0f};
+    bool has_pose_y{false};
+    float pose_y{0.0f};
+    float pose_abs_y_margin{0.0f};
     std::string class_name;
   };
 
@@ -224,6 +273,34 @@ private:
     float z_min{0.0f};
     float z_max{0.0f};
   };
+
+  static const char *adviceForRejectReason(const std::string &reason) {
+    if (reason.find("too_far_x") != std::string::npos ||
+        reason.find("too_far_dist") != std::string::npos) {
+      return "acercarse_al_contenedor";
+    }
+    if (reason.find("too_lateral") != std::string::npos ||
+        reason.find("outside_yolo_pose_y_gate") != std::string::npos ||
+        reason.find("outside_yolo_gate") != std::string::npos) {
+      return "recentrar_robot_o_contenedor";
+    }
+    if (reason.find("too_high_z") != std::string::npos) {
+      return "bajar_cabeza_o_revisar_altura";
+    }
+    if (reason.find("too_low_z") != std::string::npos) {
+      return "subir_cabeza_o_revisar_altura";
+    }
+    if (reason.find("insufficient_object_points") != std::string::npos ||
+        reason.find("no_clusters_above_floor") != std::string::npos ||
+        reason.find("floor_not_found") != std::string::npos) {
+      return "bajar_cabeza_o_acercarse_si_el_borde_no_se_ve";
+    }
+    if (reason.find("size_out_of_range") != std::string::npos ||
+        reason.find("shape_rejected") != std::string::npos) {
+      return "bajar_cabeza_si_solo_se_ve_piso_o_borde_parcial";
+    }
+    return "revisar_vista_y_posicion";
+  }
 
   void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
     if (!active_) {
@@ -254,7 +331,9 @@ private:
     }
     const bool used_yolo_roi = has_selected_yolo_roi_;
     if (!processCloud(*msg, error)) {
-      if (error.find("container_full") != std::string::npos) {
+      const bool is_full = error.find("container_full") != std::string::npos;
+      const bool reject_full = get_parameter("reject_full_containers").as_bool();
+      if (is_full && reject_full) {
         container_rejected_this_activation_ = true;
         active_ = false;
         yolo_request_failed_ = true;
@@ -270,13 +349,26 @@ private:
         return;
       }
 
+      if (get_parameter("force_owl_fallback_on_geometry_failure").as_bool() &&
+          publishOwlSeedFinalFallback(error)) {
+        RCLCPP_WARN(get_logger(),
+                    "[container_drop_tf] geometria fallo (%s); se publico "
+                    "fallback OWL validado consejo=%s",
+                    error.c_str(), adviceForRejectReason(error));
+        return;
+      }
+
       if (used_yolo_roi && get_parameter("fallback_without_yolo").as_bool()) {
         ++yolo_roi_failure_count_;
         const int max_failures =
             get_parameter("yolo_max_roi_failures").as_int();
         RCLCPP_WARN(get_logger(),
-                    "[container_drop_tf] YOLO ROI fallo %d/%d: %s",
+                    "[container_drop_tf] OWL ROI fallo %d/%d: %s",
                     yolo_roi_failure_count_, max_failures, error.c_str());
+        if (yolo_roi_failure_count_ >= max_failures &&
+            publishOwlSeedFinalFallback(error)) {
+          return;
+        }
         if (yolo_roi_failure_count_ < max_failures) {
           expandYoloRoi(yolo_roi_failure_count_);
         } else {
@@ -285,8 +377,8 @@ private:
           has_selected_yolo_roi_ = false;
           yolo_request_failed_ = true;
           RCLCPP_WARN(get_logger(),
-                      "[container_drop_tf] YOLO ROI descartado; usando "
-                      "nube completa filtrada por perimetro YOLO");
+                      "[container_drop_tf] OWL ROI descartado; usando "
+                      "nube completa filtrada por perimetro OWL");
         }
       }
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
@@ -320,8 +412,8 @@ private:
     response->success = true;
     response->message = active_ ? "container_drop_tf_enabled"
                                 : "container_drop_tf_disabled";
-    RCLCPP_INFO(get_logger(), "[container_drop_tf] %s",
-                response->message.c_str());
+    RCLCPP_DEBUG(get_logger(), "[container_drop_tf] %s",
+                 response->message.c_str());
   }
 
   void resetYoloState() {
@@ -332,21 +424,22 @@ private:
     yolo_request_stamp_ = now();
     selected_yolo_roi_ = ImageRoi{};
     yolo_gate_roi_ = ImageRoi{};
+    owl_seed_rois_.clear();
     has_yolo_gate_roi_ = false;
     yolo_future_ = {};
   }
 
   void requestYoloDetections() {
     if (!get_parameter("use_yolo_roi").as_bool()) {
-      RCLCPP_INFO(get_logger(),
-                  "[container_drop_tf] YOLO ROI deshabilitado por parametro");
+      RCLCPP_DEBUG(get_logger(),
+                   "[container_drop_tf] OWL ROI deshabilitado por parametro");
       return;
     }
 
     if (!yolo_client_->wait_for_service(100ms)) {
       yolo_request_failed_ = true;
       RCLCPP_WARN(get_logger(),
-                  "[container_drop_tf] YOLO no disponible en %s; usando "
+                  "[container_drop_tf] OWL no disponible en %s; usando "
                   "fallback geometrico si esta permitido",
                   get_parameter("yolo_service").as_string().c_str());
       return;
@@ -363,11 +456,11 @@ private:
     for (const auto &query : request->queries) {
       query_list += query_list.empty() ? query : "," + query;
     }
-    RCLCPP_INFO(get_logger(),
-                "[container_drop_tf] YOLO request enviado: service=%s "
-                "queries=[%s]",
-                get_parameter("yolo_service").as_string().c_str(),
-                query_list.c_str());
+    RCLCPP_DEBUG(get_logger(),
+                 "[container_drop_tf] OWL request enviado: service=%s "
+                 "queries=[%s]",
+                 get_parameter("yolo_service").as_string().c_str(),
+                 query_list.c_str());
   }
 
   bool prepareYoloRoiForCloud() {
@@ -388,9 +481,9 @@ private:
       const double timeout =
           get_parameter("yolo_wait_timeout_sec").as_double();
       if (elapsed < timeout) {
-        RCLCPP_INFO_THROTTLE(
+        RCLCPP_DEBUG_THROTTLE(
             get_logger(), *get_clock(), 500,
-            "[container_drop_tf] esperando YOLO ROI elapsed=%.2f/%.2f",
+            "[container_drop_tf] esperando OWL ROI elapsed=%.2f/%.2f",
             elapsed, timeout);
         return false;
       }
@@ -398,7 +491,7 @@ private:
       yolo_request_pending_ = false;
       yolo_request_failed_ = true;
       RCLCPP_WARN(get_logger(),
-                  "[container_drop_tf] YOLO timeout despues de %.2fs",
+                  "[container_drop_tf] OWL timeout despues de %.2fs",
                   elapsed);
     }
 
@@ -406,7 +499,7 @@ private:
         !get_parameter("fallback_without_yolo").as_bool()) {
       RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 1000,
-          "[container_drop_tf] sin YOLO ROI y fallback deshabilitado");
+          "[container_drop_tf] sin OWL ROI y fallback deshabilitado");
       return false;
     }
 
@@ -414,12 +507,12 @@ private:
       if (has_yolo_gate_roi_) {
         RCLCPP_WARN_THROTTLE(
             get_logger(), *get_clock(), 2000,
-            "[container_drop_tf] procesando nube completa con gate YOLO");
+            "[container_drop_tf] procesando nube completa con gate OWL");
         return true;
       }
       RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 2000,
-          "[container_drop_tf] procesando sin YOLO ROI (fallback geometrico)");
+          "[container_drop_tf] procesando sin OWL ROI (fallback geometrico)");
     }
     return true;
   }
@@ -430,7 +523,7 @@ private:
     if (!response || !response->success || response->detections.empty()) {
       yolo_request_failed_ = true;
       RCLCPP_WARN(get_logger(),
-                  "[container_drop_tf] YOLO sin detecciones utiles: %s",
+                  "[container_drop_tf] OWL sin detecciones utiles: %s",
                   response ? response->message.c_str() : "null_response");
       return;
     }
@@ -441,9 +534,9 @@ private:
     ImageRoi best;
     double best_score = -std::numeric_limits<double>::max();
 
-    RCLCPP_INFO(get_logger(),
-                "[container_drop_tf] YOLO detections=%zu message='%s'",
-                response->detections.size(), response->message.c_str());
+    RCLCPP_DEBUG(get_logger(),
+                 "[container_drop_tf] OWL detections=%zu message='%s'",
+                 response->detections.size(), response->message.c_str());
 
     std::unordered_map<std::string, int> class_counts;
     for (const auto &det : response->detections) {
@@ -470,7 +563,7 @@ private:
         base_y = tf.transform.translation.y;
       } catch (const tf2::TransformException &ex) {
         RCLCPP_DEBUG(get_logger(),
-                     "[container_drop_tf] YOLO det sin TF frame=%s error=%s",
+                     "[container_drop_tf] OWL det sin TF frame=%s error=%s",
                      frame.c_str(), ex.what());
       }
 
@@ -486,9 +579,9 @@ private:
                            1.00 * distance_score + lateral_score -
                            0.15 * center_offset;
 
-      RCLCPP_INFO(
+      RCLCPP_DEBUG(
           get_logger(),
-          "[container_drop_tf] YOLO det class='%s' conf=%.2f bbox=(%.0f %.0f "
+          "[container_drop_tf] OWL det class='%s' conf=%.2f bbox=(%.0f %.0f "
           "%.0f %.0f) area=%.0f frame=%s base=(%.3f %.3f) tf=%s score=%.3f",
           det.class_name.c_str(), det.confidence, det.x_min, det.y_min,
           det.x_max, det.y_max, area, frame.c_str(), base_x, base_y,
@@ -498,18 +591,30 @@ private:
         continue;
       }
 
+      ImageRoi accepted;
+      accepted.class_name = det.class_name;
+      accepted.confidence = det.confidence;
+      accepted.score = score;
+      accepted.bbox_width = width;
+      accepted.bbox_height = height;
+      accepted.base_x_min = static_cast<int>(std::floor(det.x_min)) - padding;
+      accepted.base_y_min = static_cast<int>(std::floor(det.y_min)) - padding;
+      accepted.base_x_max = static_cast<int>(std::ceil(det.x_max)) + padding;
+      accepted.base_y_max = static_cast<int>(std::ceil(det.y_max)) + padding;
+      accepted.x_min = accepted.base_x_min;
+      accepted.y_min = accepted.base_y_min;
+      accepted.x_max = accepted.base_x_max;
+      accepted.y_max = accepted.base_y_max;
+      accepted.has_base_pose = has_tf;
+      accepted.base_x = base_x;
+      accepted.base_y = base_y;
+      if (accepted.has_base_pose) {
+        owl_seed_rois_.push_back(accepted);
+      }
+
       if (!found || score > best_score) {
         best_score = score;
-        best.class_name = det.class_name;
-        best.confidence = det.confidence;
-        best.base_x_min = static_cast<int>(std::floor(det.x_min)) - padding;
-        best.base_y_min = static_cast<int>(std::floor(det.y_min)) - padding;
-        best.base_x_max = static_cast<int>(std::ceil(det.x_max)) + padding;
-        best.base_y_max = static_cast<int>(std::ceil(det.y_max)) + padding;
-        best.x_min = best.base_x_min;
-        best.y_min = best.base_y_min;
-        best.x_max = best.base_x_max;
-        best.y_max = best.base_y_max;
+        best = accepted;
         found = true;
       }
     }
@@ -517,7 +622,7 @@ private:
     if (!found) {
       yolo_request_failed_ = true;
       RCLCPP_WARN(get_logger(),
-                  "[container_drop_tf] YOLO detecciones descartadas por "
+                  "[container_drop_tf] OWL detecciones descartadas por "
                   "confianza/tamano min_conf=%.2f",
                   min_conf);
       return;
@@ -525,15 +630,24 @@ private:
 
     selected_yolo_roi_ = best;
     yolo_gate_roi_ = best;
+    std::sort(owl_seed_rois_.begin(), owl_seed_rois_.end(),
+              [](const ImageRoi &a, const ImageRoi &b) {
+                return a.score > b.score;
+              });
     has_selected_yolo_roi_ = true;
     has_yolo_gate_roi_ = true;
     RCLCPP_INFO(get_logger(),
-                "[container_drop_tf] YOLO ROI elegido class='%s' conf=%.2f "
-                "bbox_padded=(%d %d %d %d)",
+                "[container_drop_tf] OWL seleccionado class='%s' conf=%.2f "
+                "bbox_px=(%.0f %.0f) bbox_padded=(%d %d %d %d) "
+                "base=(%.3f %.3f) tf=%s score=%.2f",
                 selected_yolo_roi_.class_name.c_str(),
-                selected_yolo_roi_.confidence, selected_yolo_roi_.x_min,
+                selected_yolo_roi_.confidence, selected_yolo_roi_.bbox_width,
+                selected_yolo_roi_.bbox_height, selected_yolo_roi_.x_min,
                 selected_yolo_roi_.y_min, selected_yolo_roi_.x_max,
-                selected_yolo_roi_.y_max);
+                selected_yolo_roi_.y_max, selected_yolo_roi_.base_x,
+                selected_yolo_roi_.base_y,
+                selected_yolo_roi_.has_base_pose ? "true" : "false",
+                selected_yolo_roi_.score);
   }
 
   void expandYoloRoi(int failure_count) {
@@ -547,11 +661,207 @@ private:
     has_yolo_gate_roi_ = true;
 
     RCLCPP_WARN(get_logger(),
-                "[container_drop_tf] expandiendo YOLO ROI por falla: "
+                "[container_drop_tf] expandiendo OWL ROI por falla: "
                 "failure=%d extra=%d bbox=(%d %d %d %d)",
                 failure_count, extra, selected_yolo_roi_.x_min,
                 selected_yolo_roi_.y_min, selected_yolo_roi_.x_max,
                 selected_yolo_roi_.y_max);
+  }
+
+  bool selectOwlSeed(double &seed_x, double &seed_y,
+                     const ImageRoi *&roi, const ImageRoi *&pair_roi,
+                     std::string &seed_source) const {
+    roi = nullptr;
+    pair_roi = nullptr;
+    seed_source = "single";
+    if (has_selected_yolo_roi_ && selected_yolo_roi_.has_base_pose) {
+      roi = &selected_yolo_roi_;
+    } else if (has_yolo_gate_roi_ && yolo_gate_roi_.has_base_pose) {
+      roi = &yolo_gate_roi_;
+    }
+    if (roi == nullptr) {
+      return false;
+    }
+
+    seed_x = roi->base_x;
+    seed_y = roi->base_y;
+    const double max_pair_separation =
+        get_parameter("owl_seed_pair_max_separation_m").as_double();
+    double best_pair_separation = 0.0;
+    for (const auto &candidate_roi : owl_seed_rois_) {
+      if (&candidate_roi == roi ||
+          candidate_roi.class_name != roi->class_name ||
+          !candidate_roi.has_base_pose) {
+        continue;
+      }
+      const double separation =
+          std::hypot(candidate_roi.base_x - roi->base_x,
+                     candidate_roi.base_y - roi->base_y);
+      if (separation < 0.01 || separation > max_pair_separation) {
+        continue;
+      }
+      if (separation > best_pair_separation) {
+        pair_roi = &candidate_roi;
+        best_pair_separation = separation;
+      }
+    }
+    if (pair_roi != nullptr) {
+      seed_x = 0.5 * (roi->base_x + pair_roi->base_x);
+      seed_y = 0.5 * (roi->base_y + pair_roi->base_y);
+      seed_source = "pair_midpoint";
+    }
+    return true;
+  }
+
+  bool publishOwlGuidedGeometryFallback(
+      const pcl::PointCloud<pcl::PointXYZ>::Ptr &support_cloud,
+      const std::string &last_error) {
+    if (!get_parameter("use_owl_guided_geometry_fallback").as_bool()) {
+      return false;
+    }
+
+    double seed_x = 0.0;
+    double seed_y = 0.0;
+    const ImageRoi *roi = nullptr;
+    const ImageRoi *pair_roi = nullptr;
+    std::string seed_source;
+    if (!selectOwlSeed(seed_x, seed_y, roi, pair_roi, seed_source)) {
+      RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "[container_drop_tf] fallback geometrico guiado por OWL no "
+          "disponible: sin TF base_link de OWL last_error=%s",
+          last_error.c_str());
+      return false;
+    }
+
+    const float window_x = static_cast<float>(
+        get_parameter("owl_guided_geometry_window_x_m").as_double());
+    const float window_y = static_cast<float>(
+        get_parameter("owl_guided_geometry_window_y_m").as_double());
+    const int min_points =
+        get_parameter("owl_guided_geometry_min_points").as_int();
+    const float seed_x_f = static_cast<float>(seed_x);
+    const float seed_y_f = static_cast<float>(seed_y);
+
+    int local_points = 0;
+    Eigen::Vector3f sum(0.0f, 0.0f, 0.0f);
+    Eigen::Vector3f min_pt(std::numeric_limits<float>::max(),
+                           std::numeric_limits<float>::max(),
+                           std::numeric_limits<float>::max());
+    Eigen::Vector3f max_pt(-std::numeric_limits<float>::max(),
+                           -std::numeric_limits<float>::max(),
+                           -std::numeric_limits<float>::max());
+    if (support_cloud) {
+      for (const auto &pt : support_cloud->points) {
+        if (!std::isfinite(pt.x) || !std::isfinite(pt.y) ||
+            !std::isfinite(pt.z)) {
+          continue;
+        }
+        if (std::fabs(pt.x - seed_x_f) > window_x ||
+            std::fabs(pt.y - seed_y_f) > window_y) {
+          continue;
+        }
+        const Eigen::Vector3f p(pt.x, pt.y, pt.z);
+        sum += p;
+        min_pt = min_pt.cwiseMin(p);
+        max_pt = max_pt.cwiseMax(p);
+        ++local_points;
+      }
+    }
+
+    const bool has_local_geometry = local_points >= min_points;
+    double refined_x = seed_x;
+    double refined_y = seed_y;
+    if (has_local_geometry) {
+      const Eigen::Vector3f mean = sum / static_cast<float>(local_points);
+      const double legacy_refine_max =
+          std::max(0.0, get_parameter("owl_seed_xy_refine_max_m").as_double());
+      const double configured_refine_max_x =
+          get_parameter("owl_seed_refine_max_x_m").as_double();
+      const double configured_refine_max_y =
+          get_parameter("owl_seed_refine_max_y_m").as_double();
+      const double refine_max_x =
+          configured_refine_max_x >= 0.0 ? configured_refine_max_x
+                                         : legacy_refine_max;
+      const double refine_max_y =
+          configured_refine_max_y >= 0.0 ? configured_refine_max_y
+                                         : legacy_refine_max;
+      refined_x =
+          seed_x + std::clamp(static_cast<double>(mean.x()) - seed_x,
+                              -refine_max_x, refine_max_x);
+      refined_y =
+          seed_y + std::clamp(static_cast<double>(mean.y()) - seed_y,
+                              -refine_max_y, refine_max_y);
+    }
+
+    const double x_offset =
+        pair_roi != nullptr
+            ? get_parameter("owl_seed_pair_fallback_x_offset_m").as_double()
+            : get_parameter("owl_seed_fallback_x_offset_m").as_double();
+    double drop_x = refined_x + x_offset;
+    if (has_local_geometry && get_parameter("prefer_near_edge_drop").as_bool()) {
+      drop_x = static_cast<double>(min_pt.x()) +
+               get_parameter("near_edge_drop_inset_m").as_double();
+    }
+    const float x = static_cast<float>(drop_x);
+    const float y = static_cast<float>(
+        refined_y + get_parameter("owl_seed_fallback_y_offset_m").as_double());
+    const double base_z = get_parameter("drop_z_override_m").as_double();
+    const double z_extra =
+        get_parameter("owl_seed_fallback_z_extra_m").as_double();
+    const double z_min = get_parameter("safe_z_min_m").as_double();
+    const double z_max = get_parameter("safe_z_max_m").as_double();
+    const float z =
+        static_cast<float>(std::clamp(base_z + z_extra, z_min, z_max));
+
+    Candidate candidate;
+    candidate.center_floor =
+        Eigen::Vector3f(x, y, has_local_geometry ? min_pt.z() : 0.0f);
+    candidate.drop_start = Eigen::Vector3f(x, y, z);
+    candidate.axis_x = Eigen::Vector3f(1.0f, 0.0f, 0.0f);
+    candidate.axis_y = Eigen::Vector3f(0.0f, 1.0f, 0.0f);
+    candidate.axis_z = Eigen::Vector3f(0.0f, 0.0f, 1.0f);
+    if (has_local_geometry) {
+      candidate.width = max_pt.x() - min_pt.x();
+      candidate.depth = max_pt.y() - min_pt.y();
+      candidate.height = max_pt.z() - min_pt.z();
+      candidate.coverage = 0.25f;
+      candidate.interior_fill = 0.0f;
+      candidate.score = 0.15f;
+    }
+
+    RCLCPP_WARN(
+        get_logger(),
+        "[container_drop_tf] marca OWL guiada por geometria: class='%s' "
+        "source=%s bbox_px=(%.0f %.0f) owl_seed=(%.3f %.3f) "
+        "refined=(%.3f %.3f) local_points=%d/%d "
+        "near_edge_x=%.3f inset=%.3f "
+        "local_xyz=[%.3f %.3f %.3f -> %.3f %.3f %.3f] "
+        "drop=(%.3f %.3f %.3f) motivo_geometria=%s",
+        roi->class_name.c_str(), seed_source.c_str(), roi->bbox_width,
+        roi->bbox_height, seed_x, seed_y, refined_x, refined_y, local_points,
+        min_points, has_local_geometry ? min_pt.x() : 0.0f,
+        get_parameter("near_edge_drop_inset_m").as_double(),
+        has_local_geometry ? min_pt.x() : 0.0f,
+        has_local_geometry ? min_pt.y() : 0.0f,
+        has_local_geometry ? min_pt.z() : 0.0f,
+        has_local_geometry ? max_pt.x() : 0.0f,
+        has_local_geometry ? max_pt.y() : 0.0f,
+        has_local_geometry ? max_pt.z() : 0.0f, candidate.drop_start.x(),
+        candidate.drop_start.y(), candidate.drop_start.z(),
+        last_error.c_str());
+
+    std::string publish_error;
+    if (!publishValidatedCandidate(candidate, "owl_guided_geometry_fallback",
+                                   publish_error)) {
+      RCLCPP_WARN(get_logger(),
+                  "[container_drop_tf] marca OWL guiada rechazada: %s "
+                  "consejo=%s",
+                  publish_error.c_str(), adviceForRejectReason(publish_error));
+      set_parameter(rclcpp::Parameter("last_error", publish_error));
+      return false;
+    }
+    return true;
   }
 
   bool processCloud(const sensor_msgs::msg::PointCloud2 &input_msg,
@@ -590,13 +900,14 @@ private:
         new pcl::PointCloud<pcl::PointXYZ>);
     // La ROI reduce falsos positivos: buscamos contenedores bajos y cercanos,
     // no paredes, personas ni muebles fuera del alcance de drop.
-    applyRoi(validation_cloud, roi_cloud);
+    applyRoi(validation_cloud, roi_cloud,
+             yolo_gate_bounds.valid ? &yolo_gate_bounds : nullptr);
     publishDebugCloud(*roi_cloud, validation_frame_id_);
 
-    RCLCPP_INFO_THROTTLE(
+    RCLCPP_DEBUG_THROTTLE(
         get_logger(), *get_clock(), 1500,
         "[container_drop_tf] ROI puntos: entrada=%zu validation=%zu roi=%zu "
-        "yolo_roi=%s",
+        "owl_roi=%s",
         cloud->size(), validation_cloud->size(), roi_cloud->size(),
         image_roi ? selected_yolo_roi_.class_name.c_str()
                   : (yolo_gate_bounds.valid ? "gate_only" : "none"));
@@ -604,6 +915,9 @@ private:
     if (roi_cloud->size() < 500) {
       error_out = "insufficient_points_after_roi count=" +
                   std::to_string(roi_cloud->size());
+      if (publishOwlGuidedGeometryFallback(roi_cloud, error_out)) {
+        return true;
+      }
       return false;
     }
 
@@ -613,6 +927,9 @@ private:
     // El piso es la referencia para medir altura real del contenedor.
     if (!segmentFloor(roi_cloud, floor_coefficients, floor_inliers,
                       error_out)) {
+      if (publishOwlGuidedGeometryFallback(roi_cloud, error_out)) {
+        return true;
+      }
       return false;
     }
 
@@ -635,7 +952,7 @@ private:
     // Esto deja candidatos tipo bote/caja y reduce ruido de suelo.
     filterObjectsAboveFloor(object_cloud, floor_z, above_floor_cloud);
 
-    RCLCPP_INFO_THROTTLE(
+    RCLCPP_DEBUG_THROTTLE(
         get_logger(), *get_clock(), 1500,
         "[container_drop_tf] piso inliers=%zu objetos=%zu sobre_piso=%zu "
         "floor_z=%.3f",
@@ -645,6 +962,9 @@ private:
     if (above_floor_cloud->size() < 100) {
       error_out = "insufficient_object_points count=" +
                   std::to_string(above_floor_cloud->size());
+      if (publishOwlGuidedGeometryFallback(roi_cloud, error_out)) {
+        return true;
+      }
       return false;
     }
 
@@ -653,6 +973,9 @@ private:
     extractClusters(above_floor_cloud, clusters);
     if (clusters.empty()) {
       error_out = "no_clusters_above_floor";
+      if (publishOwlGuidedGeometryFallback(roi_cloud, error_out)) {
+        return true;
+      }
       return false;
     }
 
@@ -662,22 +985,133 @@ private:
                              error_out,
                              yolo_gate_bounds.valid ? &yolo_gate_bounds
                                                     : nullptr)) {
+      if (publishOwlGuidedGeometryFallback(roi_cloud, error_out)) {
+        return true;
+      }
+      return false;
+    }
+    refineCandidateWithOwlPoseSeed(
+        best, yolo_gate_bounds.valid ? &yolo_gate_bounds : nullptr);
+
+    return publishValidatedCandidate(best, "geometry", error_out);
+  }
+
+  bool publishOwlSeedFinalFallback(const std::string &last_error) {
+    if (!get_parameter("use_owl_seed_final_fallback").as_bool()) {
       return false;
     }
 
-    if (!validateDropStartPose(best.drop_start, error_out)) {
+    const ImageRoi *roi = nullptr;
+    if (has_selected_yolo_roi_ && selected_yolo_roi_.has_base_pose) {
+      roi = &selected_yolo_roi_;
+    } else if (has_yolo_gate_roi_ && yolo_gate_roi_.has_base_pose) {
+      roi = &yolo_gate_roi_;
+    }
+    if (roi == nullptr) {
+      RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "[container_drop_tf] fallback OWL final no disponible: "
+          "sin TF base_link de OWL last_error=%s",
+          last_error.c_str());
       return false;
     }
 
-    Candidate fixed_best = best;
+    double seed_x = roi->base_x;
+    double seed_y = roi->base_y;
+    std::string seed_source = "single";
+    const double max_pair_separation =
+        get_parameter("owl_seed_pair_max_separation_m").as_double();
+    const ImageRoi *pair_roi = nullptr;
+    double best_pair_separation = 0.0;
+    for (const auto &candidate_roi : owl_seed_rois_) {
+      if (&candidate_roi == roi ||
+          candidate_roi.class_name != roi->class_name ||
+          !candidate_roi.has_base_pose) {
+        continue;
+      }
+      const double separation =
+          std::hypot(candidate_roi.base_x - roi->base_x,
+                     candidate_roi.base_y - roi->base_y);
+      if (separation < 0.01 || separation > max_pair_separation) {
+        continue;
+      }
+      // Si OWL ve frente y fondo del mismo contenedor, el par mas separado
+      // dentro del maximo suele representar mejor el eje front/back.
+      if (separation > best_pair_separation) {
+        pair_roi = &candidate_roi;
+        best_pair_separation = separation;
+      }
+    }
+    if (pair_roi != nullptr) {
+      seed_x = 0.5 * (roi->base_x + pair_roi->base_x);
+      seed_y = 0.5 * (roi->base_y + pair_roi->base_y);
+      seed_source = "pair_midpoint";
+    }
+
+    const double x_offset =
+        pair_roi != nullptr
+            ? get_parameter("owl_seed_pair_fallback_x_offset_m").as_double()
+            : get_parameter("owl_seed_fallback_x_offset_m").as_double();
+    const float x = static_cast<float>(seed_x + x_offset);
+    const float y = static_cast<float>(
+        seed_y + get_parameter("owl_seed_fallback_y_offset_m").as_double());
+    const double base_z = get_parameter("drop_z_override_m").as_double();
+    const double z_extra =
+        get_parameter("owl_seed_fallback_z_extra_m").as_double();
+    const double z_min = get_parameter("safe_z_min_m").as_double();
+    const double z_max = get_parameter("safe_z_max_m").as_double();
+    const float z =
+        static_cast<float>(std::clamp(base_z + z_extra, z_min, z_max));
+
+    Candidate candidate;
+    candidate.center_floor = Eigen::Vector3f(x, y, 0.0f);
+    candidate.drop_start = Eigen::Vector3f(x, y, z);
+    candidate.axis_x = Eigen::Vector3f(1.0f, 0.0f, 0.0f);
+    candidate.axis_y = Eigen::Vector3f(0.0f, 1.0f, 0.0f);
+    candidate.axis_z = Eigen::Vector3f(0.0f, 0.0f, 1.0f);
+    candidate.score = 0.0f;
+
+    RCLCPP_WARN(
+        get_logger(),
+        "[container_drop_tf] marca fallback OWL: class='%s' source=%s "
+        "bbox_px=(%.0f %.0f) owl_base=(%.3f %.3f) pair=(%.3f %.3f) "
+        "drop=(%.3f %.3f %.3f) motivo_geometria=%s consejo=%s",
+        roi->class_name.c_str(), seed_source.c_str(), roi->bbox_width,
+        roi->bbox_height, roi->base_x, roi->base_y,
+        pair_roi ? pair_roi->base_x : 0.0,
+        pair_roi ? pair_roi->base_y : 0.0, candidate.drop_start.x(),
+        candidate.drop_start.y(), candidate.drop_start.z(),
+        last_error.c_str(), adviceForRejectReason(last_error));
+
+    std::string publish_error;
+    if (!publishValidatedCandidate(candidate, "owl_seed_final_fallback",
+                                   publish_error)) {
+      RCLCPP_WARN(get_logger(),
+                  "[container_drop_tf] fallback final desde OWL rechazado: "
+                  "%s consejo=%s",
+                  publish_error.c_str(), adviceForRejectReason(publish_error));
+      set_parameter(rclcpp::Parameter("last_error", publish_error));
+      return false;
+    }
+    return true;
+  }
+
+  bool publishValidatedCandidate(const Candidate &candidate,
+                                 const std::string &source,
+                                 std::string &error_out) {
+    if (!validateDropStartPose(candidate.drop_start, error_out)) {
+      return false;
+    }
+
+    Candidate fixed_candidate = candidate;
     // Publicamos las TF en fixed_frame como estaticas para que permanezcan
     // visibles/disponibles hasta que una nueva busqueda las reemplace.
-    if (!transformCandidateToFixed(fixed_best, error_out)) {
+    if (!transformCandidateToFixed(fixed_candidate, error_out)) {
       return false;
     }
 
-    publishTransforms(fixed_best);
-    saveDropPoint(fixed_best.drop_start);
+    publishTransforms(fixed_candidate);
+    saveDropPoint(fixed_candidate.drop_start);
     publishMarkers();
     drop_point_saved_this_activation_ = true;
     set_parameter(rclcpp::Parameter("last_result", "success"));
@@ -686,13 +1120,14 @@ private:
 
     RCLCPP_INFO(
         get_logger(),
-        "[container_drop_tf] TF %s publicada: base=(%.3f %.3f %.3f) "
-        "size=(%.3f %.3f %.3f) coverage=%.2f interior=%.2f score=%.2f "
-        "mode=%s",
-        drop_start_frame_id_.c_str(), best.drop_start.x(),
-        best.drop_start.y(), best.drop_start.z(), best.width, best.depth,
-        best.height, best.coverage, best.interior_fill, best.score,
-        best.partial_rim ? "partial_rim" : "full");
+        "[container_drop_tf] marca aceptada frame=%s source=%s "
+        "base=(%.3f %.3f %.3f) nube_size_m=(%.3f %.3f %.3f) "
+        "coverage=%.2f interior=%.2f score=%.2f mode=%s",
+        drop_start_frame_id_.c_str(), source.c_str(),
+        candidate.drop_start.x(), candidate.drop_start.y(),
+        candidate.drop_start.z(), candidate.width, candidate.depth,
+        candidate.height, candidate.coverage, candidate.interior_fill,
+        candidate.score, candidate.partial_rim ? "partial_rim" : "full");
 
     error_out.clear();
     return true;
@@ -712,11 +1147,11 @@ private:
         request,
         [this, enabled](rclcpp::Client<std_srvs::srv::SetBool>::SharedFuture future) {
           const auto response = future.get();
-          RCLCPP_INFO(get_logger(),
-                      "[container_drop_tf] filtro vacancy %s: success=%s msg='%s'",
-                      enabled ? "enable" : "disable",
-                      response->success ? "true" : "false",
-                      response->message.c_str());
+          RCLCPP_DEBUG(get_logger(),
+                       "[container_drop_tf] filtro vacancy %s: success=%s msg='%s'",
+                       enabled ? "enable" : "disable",
+                       response->success ? "true" : "false",
+                       response->message.c_str());
         });
   }
 
@@ -790,9 +1225,9 @@ private:
       if (v_max < v_min) {
         std::swap(v_min, v_max);
       }
-      RCLCPP_INFO_THROTTLE(
+      RCLCPP_DEBUG_THROTTLE(
           get_logger(), *get_clock(), 1500,
-          "[container_drop_tf] aplicando YOLO bbox en nube organizada: "
+          "[container_drop_tf] aplicando OWL bbox en nube organizada: "
           "class='%s' conf=%.2f pixel=[%d,%d -> %d,%d] cloud=%ux%u",
           image_roi->class_name.c_str(), image_roi->confidence, u_min, v_min,
           u_max, v_max, cloud->width, cloud->height);
@@ -812,22 +1247,22 @@ private:
         std::swap(gate_v_min, gate_v_max);
       }
       gate_bounds.class_name = gate_roi->class_name;
-      RCLCPP_INFO_THROTTLE(
+      RCLCPP_DEBUG_THROTTLE(
           get_logger(), *get_clock(), 1500,
-          "[container_drop_tf] usando nube completa con gate YOLO: "
+          "[container_drop_tf] usando nube completa con gate OWL: "
           "class='%s' conf=%.2f pixel=[%d,%d -> %d,%d] cloud=%ux%u",
           gate_roi->class_name.c_str(), gate_roi->confidence, gate_u_min,
           gate_v_min, gate_u_max, gate_v_max, cloud->width, cloud->height);
     } else if (image_roi != nullptr) {
       RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 2000,
-          "[container_drop_tf] YOLO ROI disponible pero la nube no esta "
+          "[container_drop_tf] OWL ROI disponible pero la nube no esta "
           "organizada; se usara nube completa cloud=%ux%u points=%zu",
           cloud->width, cloud->height, cloud->points.size());
     } else if (gate_roi != nullptr) {
       RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 2000,
-          "[container_drop_tf] gate YOLO disponible pero la nube no esta "
+          "[container_drop_tf] gate OWL disponible pero la nube no esta "
           "organizada; no se podra filtrar candidatos por perimetro "
           "cloud=%ux%u points=%zu",
           cloud->width, cloud->height, cloud->points.size());
@@ -840,6 +1275,30 @@ private:
             : cloud->size();
     validation_cloud->points.reserve(reserve_size);
     const SearchBounds search_bounds = readSearchBounds();
+    const auto seed_pose_y_gate = [&](const ImageRoi *roi) {
+      if (roi == nullptr || !roi->has_base_pose) {
+        return;
+      }
+      const float x_margin = static_cast<float>(
+          get_parameter("yolo_pose_gate_abs_x_margin_m").as_double());
+      const float y_margin = static_cast<float>(
+          get_parameter("yolo_pose_gate_abs_y_margin_m").as_double());
+      gate_bounds.valid = true;
+      gate_bounds.has_pose_x = true;
+      gate_bounds.pose_x = static_cast<float>(roi->base_x);
+      gate_bounds.pose_abs_x_margin = x_margin;
+      gate_bounds.has_pose_y = true;
+      gate_bounds.pose_y = static_cast<float>(roi->base_y);
+      gate_bounds.pose_abs_y_margin = y_margin;
+      gate_bounds.class_name = roi->class_name;
+      gate_bounds.min_x = search_bounds.x_min;
+      gate_bounds.max_x = search_bounds.x_max;
+      gate_bounds.min_y = search_bounds.y_min;
+      gate_bounds.max_y = search_bounds.y_max;
+      gate_bounds.min_z = search_bounds.z_min;
+      gate_bounds.max_z = search_bounds.z_max;
+    };
+    seed_pose_y_gate(image_roi != nullptr ? image_roi : gate_roi);
 
     const auto update_gate_bounds = [&](const Eigen::Vector3f &p) {
       if (!isInsideSearchBounds(p, search_bounds)) {
@@ -901,9 +1360,9 @@ private:
     if (can_use_gate_roi) {
       gate_bounds.valid = gate_bounds.points >= 30;
       if (gate_bounds.valid) {
-        RCLCPP_INFO_THROTTLE(
+        RCLCPP_DEBUG_THROTTLE(
             get_logger(), *get_clock(), 1500,
-            "[container_drop_tf] gate YOLO 3D: class='%s' puntos=%d "
+            "[container_drop_tf] gate OWL 3D: class='%s' puntos=%d "
             "x=[%.3f %.3f] y=[%.3f %.3f] z=[%.3f %.3f]",
             gate_bounds.class_name.c_str(), gate_bounds.points,
             gate_bounds.min_x, gate_bounds.max_x, gate_bounds.min_y,
@@ -911,7 +1370,7 @@ private:
       } else {
         RCLCPP_WARN_THROTTLE(
             get_logger(), *get_clock(), 1500,
-            "[container_drop_tf] gate YOLO sin suficientes puntos validos: "
+            "[container_drop_tf] gate OWL sin suficientes puntos validos: "
             "class='%s' puntos=%d",
             gate_bounds.class_name.c_str(), gate_bounds.points);
       }
@@ -943,11 +1402,43 @@ private:
            p.z() >= bounds.z_min && p.z() <= bounds.z_max;
   }
 
+  SearchBounds makeOwlGuidedSearchBounds(const SearchBounds &base_bounds,
+                                         const YoloGateBounds *gate) {
+    SearchBounds bounds = base_bounds;
+    if (!get_parameter("use_owl_guided_search_bounds").as_bool() ||
+        gate == nullptr || !gate->has_pose_x || !gate->has_pose_y) {
+      return bounds;
+    }
+
+    const float x_margin = static_cast<float>(
+        get_parameter("owl_guided_search_x_margin_m").as_double());
+    const float y_margin = static_cast<float>(
+        get_parameter("owl_guided_search_y_margin_m").as_double());
+
+    bounds.x_min = std::max(bounds.x_min, gate->pose_x - x_margin);
+    bounds.x_max = std::min(bounds.x_max, gate->pose_x + x_margin);
+    bounds.y_min = std::max(bounds.y_min, gate->pose_y - y_margin);
+    bounds.y_max = std::min(bounds.y_max, gate->pose_y + y_margin);
+
+    RCLCPP_DEBUG_THROTTLE(
+        get_logger(), *get_clock(), 1500,
+        "[container_drop_tf] ROI 3D guiada por OWL class='%s' "
+        "seed=(%.3f %.3f) x=[%.3f %.3f] y=[%.3f %.3f]",
+        gate->class_name.c_str(), gate->pose_x, gate->pose_y, bounds.x_min,
+        bounds.x_max, bounds.y_min, bounds.y_max);
+    return bounds;
+  }
+
+
+  //CAMARAAA, esto ya lo habia corregido!!!!
   void applyRoi(const pcl::PointCloud<pcl::PointXYZ>::Ptr &cloud,
-                pcl::PointCloud<pcl::PointXYZ>::Ptr &roi_cloud) const {
-    // Filtro rectangular en base_link. Los parametros se pueden ajustar desde
-    // launch si el robot debe buscar mas cerca/lejos o con otro campo lateral.
-    const SearchBounds search_bounds = readSearchBounds();
+                pcl::PointCloud<pcl::PointXYZ>::Ptr &roi_cloud,
+                const YoloGateBounds *gate = nullptr) {
+    // Filtro rectangular en base_link. Si OWL ya ubico el contenedor,
+    // reducimos la busqueda alrededor de esa pose para extraer caracteristicas
+    // del objeto correcto, no para aceptar mas falsos positivos.
+    const SearchBounds search_bounds =
+        makeOwlGuidedSearchBounds(readSearchBounds(), gate);
     roi_cloud->points.reserve(cloud->size());
     for (const auto &pt : cloud->points) {
       const Eigen::Vector3f p(pt.x, pt.y, pt.z);
@@ -979,7 +1470,7 @@ private:
     seg.setInputCloud(cloud);
     seg.segment(*inliers, *coefficients);
 
-    RCLCPP_INFO_THROTTLE(
+    RCLCPP_DEBUG_THROTTLE(
         get_logger(), *get_clock(), 1500,
         "[container_drop_tf] RANSAC piso: inliers=%zu coef=[%.4f %.4f %.4f "
         "%.4f]",
@@ -1036,9 +1527,9 @@ private:
     ec.setInputCloud(cloud);
     ec.extract(clusters);
 
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1500,
-                         "[container_drop_tf] clusters=%zu",
-                         clusters.size());
+    RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 1500,
+                          "[container_drop_tf] clusters=%zu",
+                          clusters.size());
   }
 
   bool selectBestContainer(const pcl::PointCloud<pcl::PointXYZ>::Ptr &cloud,
@@ -1049,6 +1540,8 @@ private:
     // Evaluamos todos los objetos y conservamos el que parezca mas contenedor:
     // buena cobertura de paredes, interior poco lleno y posicion alcanzable.
     bool found = false;
+    bool fallback_found = false;
+    Candidate fallback_best;
     std::string reject_summary;
 
     int cluster_id = 0;
@@ -1059,8 +1552,10 @@ private:
                            reject_reason)) {
         RCLCPP_INFO(
             get_logger(),
-            "[container_drop_tf] cluster[%d] rechazado: puntos=%zu reason=%s",
-            cluster_id, cluster.indices.size(), reject_reason.c_str());
+            "[container_drop_tf] marca rechazada cluster=%d puntos=%zu "
+            "motivo=%s consejo=%s",
+            cluster_id, cluster.indices.size(), reject_reason.c_str(),
+            adviceForRejectReason(reject_reason));
         if (reject_summary.empty()) {
           reject_summary = reject_reason;
         }
@@ -1072,16 +1567,60 @@ private:
         std::string gate_reject;
         if (!isCandidateInsideYoloGate(candidate, *yolo_gate_bounds,
                                        gate_reject)) {
+          if (gate_reject.find("outside_yolo_pose_y_gate") !=
+              std::string::npos) {
+            Candidate fallback_candidate = candidate;
+            refineCandidateWithOwlPoseSeed(fallback_candidate,
+                                           yolo_gate_bounds);
+            std::string fallback_safety_reject;
+            if (validateDropStartPose(fallback_candidate.drop_start,
+                                      fallback_safety_reject)) {
+              if (!fallback_found ||
+                  fallback_candidate.score > fallback_best.score) {
+                fallback_best = fallback_candidate;
+                fallback_found = true;
+              }
+              RCLCPP_INFO(
+                  get_logger(),
+                  "[container_drop_tf] marca candidata fallback_y_gate cluster=%d "
+                  "puntos=%zu center=(%.3f %.3f %.3f) "
+                  "drop_refined=(%.3f %.3f %.3f) "
+                  "size=(%.3f %.3f %.3f) score=%.2f reason=%s",
+                  cluster_id, cluster.indices.size(),
+                  fallback_candidate.center_floor.x(),
+                  fallback_candidate.center_floor.y(),
+                  fallback_candidate.center_floor.z(),
+                  fallback_candidate.drop_start.x(),
+                  fallback_candidate.drop_start.y(),
+                  fallback_candidate.drop_start.z(),
+                  fallback_candidate.width, fallback_candidate.depth,
+                  fallback_candidate.height, fallback_candidate.score,
+                  gate_reject.c_str());
+            } else {
+              RCLCPP_INFO(
+                  get_logger(),
+                  "[container_drop_tf] marca rechazada fallback_y_gate cluster=%d "
+                  "puntos=%zu drop_refined=(%.3f %.3f %.3f) "
+                  "motivo=%s safety=%s consejo=%s",
+                  cluster_id, cluster.indices.size(),
+                  fallback_candidate.drop_start.x(),
+                  fallback_candidate.drop_start.y(),
+                  fallback_candidate.drop_start.z(), gate_reject.c_str(),
+                  fallback_safety_reject.c_str(),
+                  adviceForRejectReason(fallback_safety_reject));
+            }
+          }
           RCLCPP_INFO(
               get_logger(),
-              "[container_drop_tf] cluster[%d] rechazado: puntos=%zu "
+              "[container_drop_tf] marca rechazada cluster=%d puntos=%zu "
               "center=(%.3f %.3f %.3f) drop=(%.3f %.3f %.3f) "
-              "size=(%.3f %.3f %.3f) reason=%s",
+              "nube_size_m=(%.3f %.3f %.3f) motivo=%s consejo=%s",
               cluster_id, cluster.indices.size(), candidate.center_floor.x(),
               candidate.center_floor.y(), candidate.center_floor.z(),
               candidate.drop_start.x(), candidate.drop_start.y(),
               candidate.drop_start.z(), candidate.width, candidate.depth,
-              candidate.height, gate_reject.c_str());
+              candidate.height, gate_reject.c_str(),
+              adviceForRejectReason(gate_reject));
           if (reject_summary.empty()) {
             reject_summary = gate_reject;
           }
@@ -1094,10 +1633,10 @@ private:
       if (!validateDropStartPose(candidate.drop_start, safety_reject)) {
         RCLCPP_INFO(
             get_logger(),
-            "[container_drop_tf] cluster[%d] inseguro: puntos=%zu "
+            "[container_drop_tf] marca rechazada cluster=%d puntos=%zu "
             "center=(%.3f %.3f %.3f) drop=(%.3f %.3f %.3f) "
-            "size=(%.3f %.3f %.3f) coverage=%.2f interior=%.2f score=%.2f "
-            "mode=%s reason=%s",
+            "nube_size_m=(%.3f %.3f %.3f) coverage=%.2f interior=%.2f "
+            "score=%.2f mode=%s motivo=%s consejo=%s",
             cluster_id, cluster.indices.size(), candidate.center_floor.x(),
             candidate.center_floor.y(), candidate.center_floor.z(),
             candidate.drop_start.x(), candidate.drop_start.y(),
@@ -1105,7 +1644,7 @@ private:
             candidate.height, candidate.coverage, candidate.interior_fill,
             candidate.score,
             candidate.partial_rim ? "partial_rim" : "full",
-            safety_reject.c_str());
+            safety_reject.c_str(), adviceForRejectReason(safety_reject));
         if (reject_summary.empty()) {
           reject_summary = safety_reject;
         }
@@ -1115,9 +1654,9 @@ private:
 
       RCLCPP_INFO(
           get_logger(),
-          "[container_drop_tf] cluster[%d] candidato: puntos=%zu "
+          "[container_drop_tf] marca candidata cluster=%d puntos=%zu "
           "center=(%.3f %.3f %.3f) drop=(%.3f %.3f %.3f) "
-          "size=(%.3f %.3f %.3f) coverage=%.2f interior=%.2f score=%.2f "
+          "nube_size_m=(%.3f %.3f %.3f) coverage=%.2f interior=%.2f score=%.2f "
           "mode=%s",
           cluster_id, cluster.indices.size(), candidate.center_floor.x(),
           candidate.center_floor.y(), candidate.center_floor.z(),
@@ -1135,6 +1674,16 @@ private:
     }
 
     if (!found) {
+      if (fallback_found) {
+        best = fallback_best;
+        RCLCPP_WARN(
+            get_logger(),
+            "[container_drop_tf] usando fallback geometrico controlado por "
+            "outside_yolo_pose_y_gate: drop=(%.3f %.3f %.3f) score=%.2f",
+            best.drop_start.x(), best.drop_start.y(), best.drop_start.z(),
+            best.score);
+        return true;
+      }
       error_out = "no_container_candidate clusters=" +
                   std::to_string(clusters.size()) +
                   " first_reject=" + reject_summary;
@@ -1163,6 +1712,68 @@ private:
                       std::to_string(margin);
       return false;
     }
+    if (gate.has_pose_x &&
+        std::fabs(x - gate.pose_x) > gate.pose_abs_x_margin) {
+      reject_reason =
+          "outside_yolo_pose_x_gate class=" + gate.class_name +
+          " center_x=" + std::to_string(x) +
+          " yolo_x=" + std::to_string(gate.pose_x) +
+          " margin=" + std::to_string(gate.pose_abs_x_margin);
+      return false;
+    }
+    if (gate.has_pose_y &&
+        std::fabs(y - gate.pose_y) > gate.pose_abs_y_margin) {
+      reject_reason =
+          "outside_yolo_pose_y_gate class=" + gate.class_name +
+          " center_y=" + std::to_string(y) +
+          " yolo_y=" + std::to_string(gate.pose_y) +
+          " margin=" + std::to_string(gate.pose_abs_y_margin);
+      return false;
+    }
+    return true;
+  }
+
+  bool refineCandidateWithOwlPoseSeed(Candidate &candidate,
+                                      const YoloGateBounds *gate) const {
+    if (!get_parameter("use_owl_pose_seed").as_bool() || gate == nullptr ||
+        !gate->has_pose_x || !gate->has_pose_y) {
+      return false;
+    }
+
+    const float seed_x = gate->pose_x + static_cast<float>(
+                                         get_parameter("owl_seed_drop_x_offset_m")
+                                             .as_double());
+    const float seed_y = gate->pose_y + static_cast<float>(
+                                         get_parameter("owl_seed_drop_y_offset_m")
+                                             .as_double());
+    const double legacy_refine_max =
+        std::max(0.0, get_parameter("owl_seed_xy_refine_max_m").as_double());
+    const double configured_refine_max_x =
+        get_parameter("owl_seed_refine_max_x_m").as_double();
+    const double configured_refine_max_y =
+        get_parameter("owl_seed_refine_max_y_m").as_double();
+    const float refine_max_x = static_cast<float>(
+        configured_refine_max_x >= 0.0 ? configured_refine_max_x
+                                       : legacy_refine_max);
+    const float refine_max_y = static_cast<float>(
+        configured_refine_max_y >= 0.0 ? configured_refine_max_y
+                                       : legacy_refine_max);
+    const float old_x = candidate.drop_start.x();
+    const float old_y = candidate.drop_start.y();
+    if (!get_parameter("prefer_near_edge_drop").as_bool() ||
+        !get_parameter("preserve_near_edge_drop_x").as_bool()) {
+      candidate.drop_start.x() =
+          seed_x + std::clamp(old_x - seed_x, -refine_max_x, refine_max_x);
+    }
+    candidate.drop_start.y() =
+        seed_y + std::clamp(old_y - seed_y, -refine_max_y, refine_max_y);
+
+    RCLCPP_DEBUG(get_logger(),
+                 "[container_drop_tf] OWL seed refine: seed=(%.3f %.3f) "
+                 "cloud_drop=(%.3f %.3f) refined=(%.3f %.3f) "
+                 "max=(%.3f %.3f)",
+                 seed_x, seed_y, old_x, old_y, candidate.drop_start.x(),
+                 candidate.drop_start.y(), refine_max_x, refine_max_y);
     return true;
   }
 
@@ -1180,10 +1791,12 @@ private:
     }
 
     Eigen::Vector2f mean(0.0f, 0.0f);
+    float min_base_x = std::numeric_limits<float>::max();
     float min_z = std::numeric_limits<float>::max();
     float max_z = -std::numeric_limits<float>::max();
     for (const auto &p : points) {
       mean += Eigen::Vector2f(p.x(), p.y());
+      min_base_x = std::min(min_base_x, p.x());
       min_z = std::min(min_z, p.z());
       max_z = std::max(max_z, p.z());
     }
@@ -1297,6 +1910,10 @@ private:
         static_cast<float>(get_parameter("start_clearance_m").as_double());
     const float drop_x_offset =
         static_cast<float>(get_parameter("drop_x_offset_m").as_double());
+    const bool prefer_near_edge_drop =
+        get_parameter("prefer_near_edge_drop").as_bool();
+    const float near_edge_drop_inset = static_cast<float>(
+        get_parameter("near_edge_drop_inset_m").as_double());
     const float drop_y_offset =
         static_cast<float>(get_parameter("drop_y_offset_m").as_double());
     const float partial_drop_x_offset = static_cast<float>(
@@ -1313,11 +1930,14 @@ private:
     if (override_drop_y) {
       drop_y = drop_y_override;
     }
-    // El punto de drop queda sobre el centro del hueco, un poco arriba del
-    // borde mas alto para iniciar la maniobra sin chocar con el contenedor.
-    const float final_drop_x =
+    // El punto de drop queda un poco hacia adentro del borde mas cercano al
+    // robot. Si se desactiva ese modo, se conserva el centro geometrico.
+    float final_drop_x =
         center_xy.x() + drop_x_offset +
         (partial_rim_candidate ? partial_drop_x_offset : 0.0f);
+    if (prefer_near_edge_drop) {
+      final_drop_x = min_base_x + near_edge_drop_inset;
+    }
 
     candidate.center_floor = Eigen::Vector3f(center_xy.x(), center_xy.y(),
                                              floor_z);
@@ -1447,13 +2067,35 @@ private:
     const double z_min = get_parameter("safe_z_min_m").as_double();
     const double z_max = get_parameter("safe_z_max_m").as_double();
     const double dist_max = get_parameter("safe_dist_xy_max_m").as_double();
+    constexpr double kBoundsEpsilon = 1e-4;
 
-    if (x < x_min || x > x_max || std::fabs(y) > abs_y_max || z < z_min ||
-        z > z_max || distance_xy > dist_max) {
-      error_out = "unsafe_container_drop_start frame=" +
-                  validation_frame_id_ + " x=" + std::to_string(x) +
+    std::string reason;
+    if (x < x_min - kBoundsEpsilon) {
+      reason = "too_close_x";
+    } else if (x > x_max + kBoundsEpsilon) {
+      reason = "too_far_x";
+    } else if (std::fabs(y) > abs_y_max + kBoundsEpsilon) {
+      reason = "too_lateral";
+    } else if (z < z_min - kBoundsEpsilon) {
+      reason = "too_low_z";
+    } else if (z > z_max + kBoundsEpsilon) {
+      reason = "too_high_z";
+    } else if (distance_xy > dist_max + kBoundsEpsilon) {
+      reason = "too_far_dist";
+    }
+
+    if (!reason.empty()) {
+      error_out = "unsafe_container_drop_start reason=" + reason +
+                  " frame=" + validation_frame_id_ +
+                  " x=" + std::to_string(x) +
                   " y=" + std::to_string(y) + " z=" + std::to_string(z) +
-                  " dist_xy=" + std::to_string(distance_xy);
+                  " dist_xy=" + std::to_string(distance_xy) +
+                  " limits_x=[" + std::to_string(x_min) + "," +
+                  std::to_string(x_max) + "] abs_y<=" +
+                  std::to_string(abs_y_max) + " z=[" +
+                  std::to_string(z_min) + "," + std::to_string(z_max) +
+                  "] dist<=" + std::to_string(dist_max) +
+                  " advice=" + adviceForRejectReason(reason);
       return false;
     }
     return true;
@@ -1530,6 +2172,8 @@ private:
     drop_tf.transform.translation.z = rel.dot(candidate.axis_z);
     drop_tf.transform.rotation.w = 1.0;
 
+    // Runtime TF dinamica: debe tener stamp fresco para que FindSpace pueda
+    // rechazar TFs viejas usando request_stamp.
     tf_broadcaster_->sendTransform(container_tf);
     tf_broadcaster_->sendTransform(drop_tf);
   }
@@ -1537,7 +2181,7 @@ private:
   void logCloudWindow(const pcl::PointCloud<pcl::PointXYZ>::Ptr &cloud,
                       const std::string &label) {
     if (!cloud || cloud->empty()) {
-      RCLCPP_INFO_THROTTLE(
+      RCLCPP_DEBUG_THROTTLE(
           get_logger(), *get_clock(), 1500,
           "[container_drop_tf] ventana %s sin puntos validos", label.c_str());
       return;
@@ -1558,7 +2202,7 @@ private:
       max_z = std::max(max_z, pt.z);
     }
 
-    RCLCPP_INFO_THROTTLE(
+    RCLCPP_DEBUG_THROTTLE(
         get_logger(), *get_clock(), 1500,
         "[container_drop_tf] ventana %s puntos=%zu x=[%.3f %.3f] "
         "y=[%.3f %.3f] z=[%.3f %.3f]",
@@ -1630,7 +2274,7 @@ private:
     }
 
     marker_pub_->publish(markers);
-    RCLCPP_INFO_THROTTLE(
+    RCLCPP_DEBUG_THROTTLE(
         get_logger(), *get_clock(), 1000,
         "[container_drop_tf] esferas seguras publicadas: count=%zu frame=%s "
         "topic=/vision/camera/drop_markers",
@@ -1675,6 +2319,7 @@ private:
   rclcpp::Time yolo_request_stamp_;
   ImageRoi selected_yolo_roi_;
   ImageRoi yolo_gate_roi_;
+  std::vector<ImageRoi> owl_seed_rois_;
   int next_drop_point_id_{0};
   int yolo_roi_failure_count_{0};
   bool drop_point_saved_this_activation_{false};

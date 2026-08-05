@@ -44,8 +44,8 @@ public:
     declare_parameter<std::string>("cloud_filter_enable_service",
                                    "/vision/shelf_cloud_filter/enable");
 
-    declare_parameter<double>("roi_x_min_m", 0.20);
-    declare_parameter<double>("roi_x_max_m", 1.60);
+    declare_parameter<double>("roi_x_min_m", 0.30);
+    declare_parameter<double>("roi_x_max_m", 1.20);
     declare_parameter<double>("roi_y_min_m", -0.85);
     declare_parameter<double>("roi_y_max_m", 0.85);
     declare_parameter<double>("roi_z_min_m", 0.25);
@@ -64,8 +64,8 @@ public:
     declare_parameter<double>("preferred_section_z_weight", 1.0);
     declare_parameter<int>("preferred_section_rank", 0);
 
-    declare_parameter<double>("start_height_m", 0.10);
-    declare_parameter<double>("front_margin_m", 0.07);
+    declare_parameter<double>("start_height_m", 0.05);
+    declare_parameter<double>("front_margin_m", 0.15);
     declare_parameter<double>("side_margin_m", 0.07);
     declare_parameter<double>("back_margin_m", 0.08);
     declare_parameter<double>("ceiling_margin_m", 0.10);
@@ -74,12 +74,12 @@ public:
     declare_parameter<double>("obstacle_max_height_m", 0.40);
     declare_parameter<double>("preferred_y_m", 0.0);
 
-    declare_parameter<double>("safe_x_min_m", 0.15);
-    declare_parameter<double>("safe_x_max_m", 1.35);
+    declare_parameter<double>("safe_x_min_m", 0.35);
+    declare_parameter<double>("safe_x_max_m", 0.95);
     declare_parameter<double>("safe_abs_y_max_m", 0.85);
     declare_parameter<double>("safe_z_min_m", 0.30);
-    declare_parameter<double>("safe_z_max_m", 1.70);
-    declare_parameter<double>("safe_dist_xy_max_m", 1.55);
+    declare_parameter<double>("safe_z_max_m", 1.80);
+    declare_parameter<double>("safe_dist_xy_max_m", 1.10);
     declare_parameter<bool>("active_on_start", false);
 
     pointcloud_topic_ = get_parameter("pointcloud_topic").as_string();
@@ -132,6 +132,8 @@ private:
     float y_max{0.0f};
     float z{0.0f};
     int inliers{0};
+    Eigen::Vector2f lateral_axis{0.0f, -1.0f};
+    Eigen::Vector2f depth_axis{1.0f, 0.0f};
   };
 
   struct Section {
@@ -246,9 +248,13 @@ private:
     RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), 1500,
         "[shelf_drop_tf] seccion elegida: z=%.3f front=%.3f "
-        "width=%.3f depth=%.3f height=%.3f obstaculos=%zu score=%.2f",
+        "width=%.3f depth=%.3f height=%.3f yaw_lateral=%.3f "
+        "obstaculos=%zu score=%.2f",
         section.floor.z, section.floor.x_min, section.width, section.depth,
-        section.height, obstacles.size(), section.score);
+        section.height,
+        std::atan2(section.floor.lateral_axis.y(),
+                   section.floor.lateral_axis.x()),
+        obstacles.size(), section.score);
 
     Candidate candidate;
     if (!selectCandidate(section, obstacles, candidate, error_out)) {
@@ -468,6 +474,30 @@ private:
     if (!plane.cloud->empty()) {
       plane.centroid = sum / static_cast<float>(plane.cloud->size());
       plane.z = plane.centroid.z();
+
+      if (plane.cloud->size() >= 3) {
+        Eigen::Matrix2f covariance = Eigen::Matrix2f::Zero();
+        for (const auto &pt : plane.cloud->points) {
+          const Eigen::Vector2f d(pt.x - plane.centroid.x(),
+                                  pt.y - plane.centroid.y());
+          covariance += d * d.transpose();
+        }
+
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix2f> solver(covariance);
+        if (solver.info() == Eigen::Success) {
+          Eigen::Vector2f lateral = solver.eigenvectors().col(1).normalized();
+          if (lateral.y() > 0.0f) {
+            lateral = -lateral;
+          }
+          Eigen::Vector2f depth(-lateral.y(), lateral.x());
+          if (depth.x() < 0.0f) {
+            lateral = -lateral;
+            depth = -depth;
+          }
+          plane.lateral_axis = lateral;
+          plane.depth_axis = depth;
+        }
+      }
     }
   }
 
@@ -713,8 +743,10 @@ private:
 
     const Eigen::Vector3f origin(section.floor.x_min, section.floor.y_max,
                                  section.floor.z);
-    const Eigen::Vector3f axis_x(0.0f, -1.0f, 0.0f);
-    const Eigen::Vector3f axis_y(1.0f, 0.0f, 0.0f);
+    const Eigen::Vector3f axis_x(section.floor.lateral_axis.x(),
+                                 section.floor.lateral_axis.y(), 0.0f);
+    const Eigen::Vector3f axis_y(section.floor.depth_axis.x(),
+                                 section.floor.depth_axis.y(), 0.0f);
     const Eigen::Vector3f axis_z(0.0f, 0.0f, 1.0f);
 
     if (fixed_frame_id_ == validation_frame_id_) {
@@ -782,8 +814,12 @@ private:
     drop_tf.header.stamp = shelf_tf.header.stamp;
     drop_tf.header.frame_id = shelf_frame_id_;
     drop_tf.child_frame_id = drop_start_frame_id_;
-    drop_tf.transform.translation.x = rel.dot(Eigen::Vector3f(0.0f, -1.0f, 0.0f));
-    drop_tf.transform.translation.y = rel.dot(Eigen::Vector3f(1.0f, 0.0f, 0.0f));
+    const Eigen::Vector3f local_axis_x(section.floor.lateral_axis.x(),
+                                       section.floor.lateral_axis.y(), 0.0f);
+    const Eigen::Vector3f local_axis_y(section.floor.depth_axis.x(),
+                                       section.floor.depth_axis.y(), 0.0f);
+    drop_tf.transform.translation.x = rel.dot(local_axis_x);
+    drop_tf.transform.translation.y = rel.dot(local_axis_y);
     drop_tf.transform.translation.z = rel.z();
     drop_tf.transform.rotation.w = 1.0;
 
